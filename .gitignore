@@ -5,3 +5,6 @@ dist-server/
 .server.log
 .playwright-cli/
 .claude/
+output/playwright/*
+!output/playwright/github-*.png
+NUL
