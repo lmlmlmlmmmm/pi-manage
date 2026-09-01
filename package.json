@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "pi 本地配置管理：provider/模型/默认模型/UA 的一站式管理，npm 安装后直接启动",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lmlmlmlmmmm/pi-manage.git"
+  },
+  "homepage": "https://github.com/lmlmlmlmmmm/pi-manage#readme",
   "keywords": [
     "pi",
     "pi-coding-agent",
