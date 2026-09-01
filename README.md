@@ -73,6 +73,8 @@ npm run build
 
 `npm run dev` 启动前端开发服务；后端开发服务使用 `dev:back` 和 `dev:back:run`。
 
+创建与 `package.json` 版本一致的 `v*` Tag 并推送后，GitHub Actions 会自动构建并发布到 npm。
+
 ## 数据位置
 
 | 文件 | 用途 |
