@@ -121,16 +121,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       return true
     }
     try {
-      sendJson(res, 200, { meta: await lookupModelMeta(id, url.searchParams.get('proxy') ?? undefined) })
+      sendJson(res, 200, { meta: await lookupModelMeta(id, {
+        api: url.searchParams.get('api') ?? undefined,
+        baseUrl: url.searchParams.get('baseUrl') ?? undefined,
+        proxyOverride: url.searchParams.get('proxy') ?? undefined,
+      }) })
     } catch (e) {
       sendJson(res, 400, { error: (e as Error).message })
     }
     return true
   }
   if (req.method === 'POST') {
+    // 只接收 JSON，阻止跨站表单和 text/plain 简单请求触发写盘或 !command 解析。
+    if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
+      sendJson(res, 415, { error: '请求必须使用 application/json' })
+      return true
+    }
     let body: Record<string, unknown>
     try {
-      body = (await readBody(req)) as Record<string, unknown>
+      const parsed = await readBody(req)
+      if (!isPlainObject(parsed)) throw new Error('请求体必须是 JSON 对象')
+      body = parsed
     } catch (e) {
       sendJson(res, 400, { error: (e as Error).message })
       return true
@@ -199,23 +210,39 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         sendJson(res, 400, { error: 'settingsBaseline 必须是对象' })
         return true
       }
-      sendJson(res, 200, saveAll(library, settings ?? {}, settingsBaseline ?? undefined))
+      const revision = typeof body.revision === 'string' ? body.revision : undefined
+      sendJson(res, 200, saveAll(library, settings ?? {}, settingsBaseline ?? undefined, revision))
       return true
     }
     if (url.pathname === '/api/models/test') {
       // 模型连接测试：provider + model 整包提交（表单未保存的编辑值也可测），
-      // 请求构造与 pi 实际发送一致（端点/认证/模型级覆盖合并）；
-      // prompt 可自定义（仅本次请求，不落盘）
+      // 对齐 pi 的端点/认证/模型覆盖与基础对话参数；测试模式和提示词均不落盘。
       const provider = body.provider
       const model = body.model
       if (!isPlainObject(provider) || !isPlainObject(model) || typeof model.id !== 'string' || !model.id) {
         sendJson(res, 400, { error: '需要 provider 对象和含 id 的 model 对象' })
         return true
       }
+      if (body.stream !== undefined && typeof body.stream !== 'boolean') {
+        sendJson(res, 400, { error: 'stream 必须是布尔值' })
+        return true
+      }
       const opts = {
         prompt: typeof body.prompt === 'string' ? body.prompt.slice(0, 2000) : undefined,
+        stream: body.stream as boolean | undefined,
+        providerName: typeof body.providerName === 'string' ? body.providerName : undefined,
       }
-      sendJson(res, 200, await testModel(provider as never, model as never, opts))
+      const controller = new AbortController()
+      // 请求体读完不代表客户端仍在等待；以响应连接关闭为准取消上游。
+      const onClose = () => { if (!res.writableEnded) controller.abort() }
+      res.once('close', onClose)
+      if (res.destroyed) controller.abort()
+      try {
+        const result = await testModel(provider as never, model as never, { ...opts, signal: controller.signal })
+        if (!controller.signal.aborted && !res.destroyed) sendJson(res, 200, result)
+      } finally {
+        res.removeListener('close', onClose)
+      }
       return true
     }
     if (url.pathname === '/api/models/import') {
@@ -229,6 +256,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
           api: api as PiApi,
           baseUrl: String(body.baseUrl ?? ''),
           apiKey: String(body.apiKey ?? ''),
+          authHeader: body.authHeader === true,
           headers: (body.headers as Record<string, string> | undefined) ?? {},
         })
         sendJson(res, 200, { models })
@@ -283,6 +311,20 @@ function isAllowedHost(host: string | undefined): boolean {
   return name === '127.0.0.1' || name === 'localhost' || name === '::1'
 }
 
+function isAllowedOrigin(req: IncomingMessage): boolean {
+  // Host 只能防 DNS rebinding；来源检查同时阻止其他网页读取配置或触发本机命令。
+  const site = req.headers['sec-fetch-site']
+  if (site && site !== 'same-origin' && site !== 'none') return false
+  const origin = req.headers.origin
+  // 本机 CLI 请求通常不携带 Origin；浏览器的跨来源 POST 则必须携带它。
+  if (origin === undefined) return true
+  try {
+    return origin === new URL(`http://${req.headers.host}`).origin
+  } catch {
+    return false
+  }
+}
+
 function openBrowser(url: string): void {
   // 零依赖：按平台用默认浏览器打开
   const cmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open'
@@ -294,7 +336,7 @@ function openBrowser(url: string): void {
   }
 }
 
-export function start(port = DEFAULT_PORT, open = true): void {
+export function start(port = DEFAULT_PORT, open = true): ReturnType<typeof createServer> {
   // 启动时读应用配置（代理等）注入进程环境；显式设置的 PI_MANAGE_PROXY 环境变量优先
   initAppConfig()
   const server = createServer((req, res) => {
@@ -307,6 +349,10 @@ export function start(port = DEFAULT_PORT, open = true): void {
         }
         const url = new URL(req.url ?? '/', 'http://localhost')
         if (url.pathname.startsWith('/api/')) {
+          if (!isAllowedOrigin(req)) {
+            sendJson(res, 403, { error: '禁止跨来源访问本机接口' })
+            return
+          }
           if (await handleApi(req, res, url)) return
           sendJson(res, 404, { error: '未知 API' })
           return
@@ -332,9 +378,11 @@ export function start(port = DEFAULT_PORT, open = true): void {
   })
 
   server.listen(port, '127.0.0.1', () => {
-    const url = `http://127.0.0.1:${port}`
+    const actualPort = (server.address() as { port: number }).port
+    const url = `http://127.0.0.1:${actualPort}`
     console.log(`pi-manage 已启动: ${url}`)
     console.log('按 Ctrl+C 停止')
     if (open) openBrowser(url)
   })
+  return server
 }

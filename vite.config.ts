@@ -31,7 +31,18 @@ export default defineConfig({
     proxy: {
       // changeOrigin 把 Host 改写为 127.0.0.1:8787——后端只接受本机 Host，
       // 浏览器直发过来的 localhost:5173 会被 403
-      '/api': { target: 'http://127.0.0.1:8787', changeOrigin: true },
+      '/api': {
+        target: 'http://127.0.0.1:8787',
+        changeOrigin: true,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            // 仅转换发给 Vite 自身的同源 Origin，跨站来源原样交给后端拒绝。
+            if (req.headers.origin === `http://${req.headers.host}`) {
+              proxyReq.setHeader('Origin', 'http://127.0.0.1:8787')
+            }
+          })
+        },
+      },
     },
   },
 })

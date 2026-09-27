@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { formatTokens } from '../lib/format'
 import type { FetchedModel, PiProvider } from '../types'
+import { isAuthHeader, modelKeyHeaders, readModelApiKey } from '../lib/modelAuth'
 
 const props = defineProps<{
   show: boolean
@@ -11,11 +12,13 @@ const props = defineProps<{
   // 单选模式：用于模型表单「在线导入」——选一个模型填充当前表单；
   // 默认多选模式：用于批量导入
   single?: boolean
+  // 模型表单已选定认证来源，导入时固定连接，避免查询与保存使用不同密钥。
+  lockConnection?: boolean
 }>()
 
 const emit = defineEmits<{
   'update:show': [value: boolean]
-  imported: [models: FetchedModel[]]
+  imported: [models: FetchedModel[], connection: PiProvider]
 }>()
 
 const state = reactive({
@@ -26,10 +29,13 @@ const state = reactive({
   loading: false,
   error: '',
 })
+const fetchedConnection = ref<PiProvider | null>(null)
+let fetchVersion = 0
 
 watch(
   () => props.show,
   (show) => {
+    fetchVersion++
     if (!show) return
     const p = props.provider
     state.baseUrl = p?.baseUrl ?? ''
@@ -38,8 +44,17 @@ watch(
     state.checked = new Set()
     state.loading = false
     state.error = ''
+    fetchedConnection.value = null
   },
 )
+
+watch([() => state.baseUrl, () => state.apiKey], () => {
+  // 地址或密钥变更后旧列表不再代表当前分组，必须重新获取。
+  fetchVersion++
+  state.items = null
+  state.checked = new Set()
+  fetchedConnection.value = null
+}, { flush: 'sync' })
 
 function close() {
   emit('update:show', false)
@@ -70,41 +85,57 @@ async function fetchList() {
   }
   state.loading = true
   state.error = ''
+  const version = ++fetchVersion
+  state.items = null
+  state.checked = new Set()
+  fetchedConnection.value = null
   try {
+    const provider = props.provider ?? {}
+    const api = provider.api ?? 'openai-completions'
+    const apiKey = state.apiKey.trim()
+    let headers = { ...provider.headers }
+    if (apiKey !== (provider.apiKey ?? '').trim()) {
+      const ownedKey = readModelApiKey(headers, { ...provider, api })
+      if (Object.keys(headers).some(isAuthHeader) && ownedKey !== provider.apiKey) {
+        throw new Error('已有自定义认证 Header，请返回表单处理后再更换 API Key')
+      }
+      headers = Object.fromEntries(Object.entries(headers).filter(([name]) => !isAuthHeader(name)))
+      if (apiKey) headers = modelKeyHeaders({ api, authHeader: provider.authHeader }, headers, apiKey)
+    }
+    const connection: PiProvider = {
+      api, baseUrl: state.baseUrl.trim(), apiKey, headers, authHeader: provider.authHeader,
+    }
     // 由本机后端代发：Node 端可完整发送 provider 自定义 headers（含 User-Agent），无 CORS 限制；
     // 元数据（上下文/价格/图像/thinkingLevelMap）由后端用 models.dev 补全
     const res = await fetch('/api/models/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        // API 协议随 provider 走（决定端点和认证头），弹窗不再展示该字段
-        api: props.provider?.api ?? 'openai-completions',
-        baseUrl: state.baseUrl.trim(),
-        apiKey: state.apiKey.trim(),
-        headers: props.provider?.headers ?? {},
-      }),
+      body: JSON.stringify(connection),
     })
     const data = (await res.json()) as { models?: FetchedModel[]; error?: string }
+    if (version !== fetchVersion || !props.show) return
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
     const models = data.models ?? []
     state.items = models
+    fetchedConnection.value = connection
     // 默认全部不选，由用户自行勾选
     state.checked = new Set()
     if (models.length === 0) state.error = '接口返回了 0 个模型'
   } catch (e) {
+    if (version !== fetchVersion || !props.show) return
     state.items = null
     state.error = (e as Error).message
   } finally {
-    state.loading = false
+    if (version === fetchVersion) state.loading = false
   }
 }
 
-// 列表项右侧的元数据摘要：1.05M · $3/$12
+// 网关费率与 models.dev 参考价分开展示，避免把厂商资料误认为当前分组实际价格。
 function metaSummary(m: FetchedModel): string {
   const parts: string[] = []
   if (m.contextWindow) parts.push(formatTokens(m.contextWindow))
   if (m.cost?.input !== undefined || m.cost?.output !== undefined) {
-    parts.push(`$${m.cost?.input ?? 0}/$${m.cost?.output ?? 0}`)
+    parts.push(`${m.referenceCost ? '参考 ' : ''}$${m.cost?.input ?? 0}/$${m.cost?.output ?? 0}`)
   }
   return parts.join(' · ')
 }
@@ -120,8 +151,13 @@ function clearAll() {
 
 function doImport() {
   const picked = (state.items ?? []).filter((m) => state.checked.has(m.id))
-  if (!picked.length) return
-  emit('imported', picked)
+  const connection = fetchedConnection.value
+  if (!picked.length || !connection) return
+  if (!props.lockConnection && props.provider?.apiKey && !connection.apiKey) {
+    state.error = 'Provider 有默认密钥，匿名请求无法保存为模型独立认证。请填写模型要使用的 API Key 后重新获取。'
+    return
+  }
+  emit('imported', picked, connection)
   emit('update:show', false)
 }
 </script>
@@ -137,9 +173,9 @@ function doImport() {
   >
     <n-form label-placement="top" size="small">
       <n-form-item label="baseUrl">
-        <n-input v-model:value="state.baseUrl" class="mono" placeholder="https://example.com/v1" :disabled="state.loading" />
+        <n-input v-model:value="state.baseUrl" class="mono" placeholder="https://example.com/v1" :disabled="state.loading || props.lockConnection" />
       </n-form-item>
-      <n-form-item label="API Key">
+      <n-form-item v-if="!props.lockConnection" label="API Key">
         <n-input
           v-model:value="state.apiKey"
           type="password"
@@ -149,6 +185,9 @@ function doImport() {
         />
       </n-form-item>
     </n-form>
+    <n-alert v-if="props.lockConnection" type="info" :show-icon="false">
+      使用模型表单当前的协议、地址和密钥。需要修改时，请返回模型表单。
+    </n-alert>
 
     <div class="im-toolbar">
       <n-button size="small" type="primary" :loading="state.loading" @click="fetchList">获取模型列表</n-button>
@@ -179,7 +218,13 @@ function doImport() {
         />
         <span class="mono im-item-id">{{ m.id }}</span>
         <span v-if="m.name && m.name !== m.id" class="muted im-item-name">{{ m.name }}</span>
-        <span class="muted im-item-meta">{{ metaSummary(m) }}</span>
+        <span class="muted im-item-meta">
+          {{ metaSummary(m) }}
+          <template v-if="m.metadataSource">
+            <br />
+            <span :title="`匹配模型：${m.metadataSource.modelId}；${m.metadataSource.match === 'provider' ? '当前供应商资料' : '厂商参考资料'}`">models.dev/{{ m.metadataSource.provider }}</span>
+          </template>
+        </span>
         <n-tag v-if="m.inputImage" size="tiny" :bordered="false">图像</n-tag>
         <n-tag v-if="isExisting(m.id)" size="tiny" :bordered="false">已存在</n-tag>
       </label>

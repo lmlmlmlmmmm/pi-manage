@@ -6,17 +6,11 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { agentDir, readJson, writeFileAtomic } from './config.js'
 import { join } from 'node:path'
+import type { AppConfig } from '../src/types.js'
 
 const APP_CONFIG_FILE = join('.pi-manage', 'config.json')
 
-export interface AppConfig {
-  /** HTTP/mixed 或 SOCKS5 代理地址，如 http://127.0.0.1:10808、socks5://127.0.0.1:1080 */
-  proxy?: string
-  /** 可选代理认证；明文保存在本机私有配置中 */
-  proxyUsername?: string
-  proxyPassword?: string
-  [key: string]: unknown
-}
+export type { AppConfig } from '../src/types.js'
 
 function appConfigFile(): string {
   return join(agentDir(), APP_CONFIG_FILE)

@@ -1,7 +1,7 @@
 {
   "name": "pi-manage",
-  "version": "0.1.0",
-  "description": "pi 本地配置管理：provider/模型/默认模型/UA 的一站式管理，npm 安装后直接启动",
+  "version": "0.2.0",
+  "description": "pi 本地配置管理：Provider、模型、独立 API Key 与默认设置，支持 pi 扩展和独立启动",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,6 +10,7 @@
   "homepage": "https://github.com/lmlmlmlmmmm/pi-manage#readme",
   "keywords": [
     "pi",
+    "pi-package",
     "pi-coding-agent",
     "provider",
     "model",
@@ -21,9 +22,13 @@
     "pi-manage": "dist-server/server/entry.js"
   },
   "main": "dist-server/server/index.js",
+  "pi": {
+    "extensions": ["./extensions/pi-manage.js"]
+  },
   "files": [
     "dist",
     "dist-server",
+    "extensions",
     "README.md"
   ],
   "scripts": {

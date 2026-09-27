@@ -1,6 +1,6 @@
-import { computed, ref, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import type { AppConfig, PiLibrary, PiModel, PiModelsFile, PiProvider, PiSettings, ProviderDiff, SaveResult } from '../types'
+import type { AppConfig, LoadedState, PiLibrary, PiModel, PiModelsFile, PiProvider, PiSettings, ProviderDiff, SaveResult } from '../types'
 
 // 连接阶段：
 // loading   正在从本机后端拉取配置
@@ -58,6 +58,13 @@ export const usePiStore = defineStore('pi', () => {
   // 保存时随请求提交，后端与磁盘三方合并，避免覆盖 pi CLI 在页面打开期间写入的字段。
   // 必须与 settingsData 保持不同对象引用，否则用户编辑会连带改掉基线导致外部变更检测失效
   const settingsBaseline = ref<PiSettings>({})
+  const revision = ref('')
+  const saveConflict = ref(false)
+  // 明确选择保留本地配置时，即使编辑值未变，也需要重新同步 models.json。
+  const syncVersion = ref(0)
+  const savedSyncVersion = ref(0)
+  let loadVersion = 0
+  let disposed = false
 
   // 后端加载时算出的差异/警告
   const warnings = ref<string[]>([])
@@ -103,18 +110,20 @@ export const usePiStore = defineStore('pi', () => {
   // ---------- 连接与读取 ----------
 
   async function load(): Promise<void> {
+    const version = ++loadVersion
+    if (autoSaveTimer.value) clearTimeout(autoSaveTimer.value)
     phase.value = 'loading'
     try {
-      const state = await api<{
-        library: PiLibrary
-        settings: PiSettings
-        diffs: ProviderDiff[]
-        warnings: string[]
-        piDir: string
-      }>('/api/config')
+      const state = await api<LoadedState>('/api/config')
+      if (version !== loadVersion) return
       library.value = state.library
       settingsData.value = state.settings
       settingsBaseline.value = clone(state.settings)
+      revision.value = state.revision
+      saveConflict.value = false
+      autoSaveError.value = ''
+      syncVersion.value = 0
+      savedSyncVersion.value = 0
       warnings.value = state.warnings
       diffs.value = state.diffs
       piDir.value = state.piDir
@@ -128,6 +137,7 @@ export const usePiStore = defineStore('pi', () => {
       phase.value = 'ready'
       void loadAppConfig()
     } catch (e) {
+      if (version !== loadVersion) return
       phase.value = 'error'
       error.value = (e as Error).message
     }
@@ -143,12 +153,17 @@ export const usePiStore = defineStore('pi', () => {
 
   // ---------- 派生状态 ----------
 
-  const libraryDirty = computed(() => phase.value === 'ready' && serialize(library.value) !== librarySnapshot.value)
-  const modelsDirty = computed(() => phase.value === 'ready' && serialize(modelsData.value) !== modelsSnapshot.value)
+  const libraryJson = computed(() => serialize(library.value))
+  const modelsJson = computed(() => serialize(modelsData.value))
+  const settingsJson = computed(() => serialize(settingsData.value))
+  const libraryDirty = computed(() => phase.value === 'ready' && libraryJson.value !== librarySnapshot.value)
+  const modelsDirty = computed(() => phase.value === 'ready' && modelsJson.value !== modelsSnapshot.value)
   const settingsDirty = computed(
-    () => phase.value === 'ready' && serialize(settingsData.value) !== settingsSnapshot.value,
+    () => phase.value === 'ready' && settingsJson.value !== settingsSnapshot.value,
   )
-  const dirty = computed(() => libraryDirty.value || modelsDirty.value || settingsDirty.value)
+  const dirty = computed(() => phase.value === 'ready' && (
+    libraryDirty.value || modelsDirty.value || settingsDirty.value || syncVersion.value !== savedSyncVersion.value
+  ))
 
   const providerNames = computed(() => Object.keys(library.value.providers))
   const enabledProviderCount = computed(
@@ -167,11 +182,19 @@ export const usePiStore = defineStore('pi', () => {
 
   function updateProvider(oldName: string, newName: string, provider: PiProvider): void {
     const providers = library.value.providers
+    if (oldName !== newName && newName in providers) throw new Error(`已存在同名 provider：${newName}`)
+    const defaultId = settingsData.value.defaultModel
+    // Provider 表单整包保存也可能删除本地模型，联动规则与列表删除一致。
+    // 原本不在本地列表中的默认项可能来自 pi 内置目录，必须保留。
+    if (settingsData.value.defaultProvider === oldName && defaultId
+      && providers[oldName].config.models?.some((model) => model.id === defaultId)
+      && !provider.models?.some((model) => model.id === defaultId)) {
+      delete settingsData.value.defaultModel
+    }
     if (oldName === newName) {
       providers[oldName].config = provider
       return
     }
-    if (newName in providers) throw new Error(`已存在同名 provider：${newName}`)
     const next: PiLibrary['providers'] = {}
     for (const [k, v] of Object.entries(providers)) {
       next[k === oldName ? newName : k] = k === oldName ? { ...v, config: provider } : v
@@ -210,13 +233,19 @@ export const usePiStore = defineStore('pi', () => {
     }
   }
 
-  // 外部新增的 provider 导入到库
+  // 用户采用外部新增或修改的 provider，并同步外部启用状态。
   function importExternalProvider(name: string): void {
-    const diff = diffs.value.find((d) => d.kind === 'external-added' && d.name === name)
+    const diff = diffs.value.find((d) => d.kind !== 'external-removed' && d.name === name)
     if (!diff?.config) throw new Error(`没有可导入的外部 provider：${name}`)
-    library.value.providers[name] = { enabled: true, config: diff.config }
+    library.value.providers[name] = { enabled: true, config: clone(diff.config) }
     diffs.value = diffs.value.filter((d) => d !== diff)
     if (!selectedProvider.value) selectedProvider.value = name
+  }
+
+  function keepLocalProvider(name: string): void {
+    if (!diffs.value.some((d) => d.name === name)) return
+    diffs.value = diffs.value.filter((d) => d.name !== name)
+    syncVersion.value++
   }
 
   // 外部移除 → 同步为未启用
@@ -295,55 +324,88 @@ export const usePiStore = defineStore('pi', () => {
   const lastAutoSaveAt = ref(0)
 
   function scheduleAutoSave(): void {
-    // 未就绪/正在保存时由保存完成后的 dirty 重查触发
-    if (phase.value !== 'ready') return
     if (autoSaveTimer.value) clearTimeout(autoSaveTimer.value)
-    autoSaveTimer.value = setTimeout(() => void flushAutoSave(), AUTO_SAVE_DELAY)
+    autoSaveTimer.value = null
+    // 外部差异必须逐项确认，版本冲突必须重新加载；保留页面编辑但停止自动覆盖。
+    if (disposed || phase.value !== 'ready' || autoSaving.value || saveConflict.value || diffs.value.length || !dirty.value) return
+    autoSaveTimer.value = setTimeout(() => {
+      autoSaveTimer.value = null
+      void flushAutoSave()
+    }, AUTO_SAVE_DELAY)
   }
 
   async function flushAutoSave(): Promise<void> {
-    if (phase.value !== 'ready' || autoSaving.value || !dirty.value) return
+    if (autoSaveTimer.value) clearTimeout(autoSaveTimer.value)
+    autoSaveTimer.value = null
+    if (phase.value !== 'ready' || autoSaving.value || saveConflict.value || diffs.value.length || !dirty.value) return
+    const version = loadVersion
     autoSaving.value = true
     try {
       const r = await saveAll()
+      if (version !== loadVersion) return
       if (!r.ok) {
         autoSaveError.value = r.errors.join('\n')
       } else {
         autoSaveError.value = ''
         lastAutoSaveAt.value = Date.now()
       }
-      // 保存期间若又有新改动，再排一次（catch 住中途变更）
-      if (dirty.value) scheduleAutoSave()
     } finally {
       autoSaving.value = false
+      // 仅成功后续存请求期间的新修改；失败等待下一次编辑或手工重试，避免无限提交。
+      if (!autoSaveError.value && dirty.value) scheduleAutoSave()
     }
   }
 
-  watch(dirty, (v) => {
-    if (v) scheduleAutoSave()
+  // 判脏布尔值保持 true 时仍可能持续输入，应观察实际内容才能实现「最后一次编辑后 800ms」。
+  watch([libraryJson, settingsJson, syncVersion, () => diffs.value.length], scheduleAutoSave)
+
+  onScopeDispose(() => {
+    disposed = true
+    loadVersion++
+    if (autoSaveTimer.value) clearTimeout(autoSaveTimer.value)
   })
 
   // 保存：整包提交给后端落盘（库 + 启用投影 models.json + settings 与磁盘三方合并）
   async function saveAll(): Promise<SaveResult> {
+    if (saveConflict.value || diffs.value.length) {
+      return { ok: false, conflict: saveConflict.value, errors: ['请先处理外部配置差异或重新加载。'], written: [] }
+    }
+    const version = loadVersion
+    // 确认的是本次提交的内容，响应到达时页面上可能已有后续编辑。
+    const submittedLibrary = libraryJson.value
+    const submittedModels = modelsJson.value
+    const submittedSettings = clone(settingsData.value)
+    const submittedSyncVersion = syncVersion.value
     try {
       const result = await api<SaveResult>('/api/save', {
         method: 'POST',
         body: JSON.stringify({
-          library: library.value,
-          settings: settingsData.value,
+          library: JSON.parse(submittedLibrary) as PiLibrary,
+          settings: submittedSettings,
           settingsBaseline: settingsBaseline.value,
+          revision: revision.value,
         }),
       })
+      if (version !== loadVersion) return result
+      if (result.conflict) saveConflict.value = true
       if (result.ok) {
-        // 后端返回合并外部变更后的最终 settings：刷新编辑状态与基线，
-        // 保证下次保存的合并基准正确、判脏快照一致
-        if (result.settings) {
-          settingsData.value = result.settings
-          settingsBaseline.value = clone(result.settings)
+        const savedSettings = result.settings ?? submittedSettings
+        const next: PiSettings = Object.assign(Object.create(null), clone(savedSettings))
+        // 在服务端合并结果上重放请求期间的编辑（含删除），同时保留磁盘新增的未知字段。
+        const keys = new Set([...Object.keys(submittedSettings), ...Object.keys(settingsData.value)])
+        for (const key of keys) {
+          const current = settingsData.value[key]
+          if (JSON.stringify(current) === JSON.stringify(submittedSettings[key])) continue
+          if (current === undefined) delete next[key]
+          else next[key] = clone(current)
         }
-        librarySnapshot.value = serialize(library.value)
-        modelsSnapshot.value = serialize(modelsData.value)
-        settingsSnapshot.value = serialize(settingsData.value)
+        settingsData.value = { ...next }
+        settingsBaseline.value = clone(savedSettings)
+        revision.value = result.revision ?? revision.value
+        librarySnapshot.value = submittedLibrary
+        modelsSnapshot.value = submittedModels
+        settingsSnapshot.value = serialize(savedSettings)
+        savedSyncVersion.value = submittedSyncVersion
       }
       return result
     } catch (e) {
@@ -382,6 +444,7 @@ export const usePiStore = defineStore('pi', () => {
     setProviderEnabled,
     importExternalProvider,
     markExternalRemoved,
+    keepLocalProvider,
     addModel,
     updateModel,
     deleteModel,
@@ -390,6 +453,7 @@ export const usePiStore = defineStore('pi', () => {
     saveAll,
     autoSaving,
     autoSaveError,
+    saveConflict,
     lastAutoSaveAt,
     flushAutoSave,
   }

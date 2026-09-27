@@ -7,6 +7,7 @@ import ProviderForm from '../components/ProviderForm.vue'
 import ModelForm from '../components/ModelForm.vue'
 import TestModelModal from '../components/TestModelModal.vue'
 import { formatCost, formatTokens } from '../lib/format'
+import { isAuthHeader, readModelApiKey, redactHeaders } from '../lib/modelAuth'
 
 const store = usePiStore()
 const message = useMessage()
@@ -25,6 +26,12 @@ const selectedEnabled = computed(() => {
 const modelsList = computed<PiModel[]>(() => detail.value?.models ?? [])
 const defaultProvider = computed(() => store.settingsData.defaultProvider)
 const defaultModel = computed(() => store.settingsData.defaultModel)
+
+function modelAuthLabel(model: PiModel): string {
+  if (!Object.keys(model.headers ?? {}).some(isAuthHeader)) return ''
+  return readModelApiKey(model.headers, { ...detail.value, api: model.api ?? detail.value?.api }) !== undefined
+    ? '独立 Key' : '自定义认证'
+}
 
 // 启用/禁用：只改库标记，禁用项保留完整数据、不再投影进 models.json；结果直接反映在列表，不发 toast
 function onToggleEnabled(name: string, enabled: boolean) {
@@ -233,9 +240,9 @@ function onModelFormTest(model: PiModel) {
             <span
               v-if="detail.headers && Object.keys(detail.headers).length"
               class="pv-meta-value mono"
-              :title="JSON.stringify(detail.headers)"
+              :title="JSON.stringify(redactHeaders(detail.headers))"
             >
-              {{ JSON.stringify(detail.headers) }}
+              {{ JSON.stringify(redactHeaders(detail.headers)) }}
             </span>
             <span v-else class="muted">—</span>
           </div>
@@ -267,13 +274,16 @@ function onModelFormTest(model: PiModel) {
                   <n-tag v-if="isDefaultModel(m)" size="tiny" type="success" :bordered="false" style="margin-left: 4px">
                     默认
                   </n-tag>
+                  <n-tag v-if="modelAuthLabel(m)" size="tiny" type="info" :bordered="false" style="margin-left: 4px">
+                    {{ modelAuthLabel(m) }}
+                  </n-tag>
                   <n-tag
                     v-if="m.baseUrl || (m.headers && Object.keys(m.headers).length)"
                     size="tiny"
                     type="warning"
                     :bordered="false"
                     style="margin-left: 4px"
-                    :title="`模型级覆盖：${m.baseUrl ? 'baseUrl=' + m.baseUrl : ''}${m.headers ? ' headers=' + JSON.stringify(m.headers) : ''}`"
+                    :title="`模型级覆盖：${m.baseUrl ? 'baseUrl=' + m.baseUrl : ''}${m.headers ? ' headers=' + JSON.stringify(redactHeaders(m.headers)) : ''}`"
                   >
                     覆盖
                   </n-tag>

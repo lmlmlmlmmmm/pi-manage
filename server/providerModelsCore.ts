@@ -1,26 +1,15 @@
-// 模型列表请求的构造与解析：浏览器直连与本地代理（vite 中间件）共用。
+// 模型列表请求的构造与解析，由本机后端调用。
 // 本文件不得依赖浏览器或 Node 专属 API。
 
-import type { PiApi } from '../src/types.js'
+import type { FetchedModel, PiApi } from '../src/types.js'
 
-export interface FetchedModel {
-  id: string
-  name?: string
-  // 网关响应自带或 models.dev 补全的元数据（可选，导入时写入对应字段）
-  contextWindow?: number
-  maxTokens?: number
-  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }
-  inputImage?: boolean
-  reasoning?: boolean
-  thinkingLevelMap?: Record<string, string | null>
-}
+export type { FetchedModel } from '../src/types.js'
 
 export interface ProviderModelsRequest {
   url: string
   /** OpenAI 兼容网关常见的备用列表地址（例如 baseUrl 未包含 /v1 时） */
   fallbackUrls?: string[]
-  // 认证相关 headers；provider 自定义 headers（如 User-Agent）由调用方合并。
-  // 浏览器直连时 UA 会被 Fetch 规范丢弃，Node 代理则可完整发送
+  // 协议要求的基础请求头；认证和自定义 Header 由调用方统一解析后合并。
   headers: Record<string, string>
 }
 
@@ -49,23 +38,23 @@ function perMillion(v: string | undefined): number | undefined {
   return Math.round(n * 1_000_000 * 10_000) / 10_000
 }
 
-// 各协议的模型列表端点与认证头
-export function buildProviderModelsRequest(api: PiApi, baseUrl: string, apiKey: string): ProviderModelsRequest {
+// 各协议的模型列表端点与基础请求头
+export function buildProviderModelsRequest(api: PiApi, baseUrl: string): ProviderModelsRequest {
   switch (api) {
     case 'anthropic-messages':
       return {
-        // limit=1000 覆盖绝大多数模型数，超出部分不再翻页
+        // 每页最多 1000 条，后续由 has_more / last_id 继续翻页。
         url: joinUrl(baseUrl, '/v1/models?limit=1000'),
         headers: {
           'anthropic-version': '2023-06-01',
           // 官方 api.anthropic.com 依赖此头才放行浏览器跨域；自定义代理通常忽略它
           'anthropic-dangerous-direct-browser-access': 'true',
-          ...(apiKey ? { 'x-api-key': apiKey } : {}),
         },
       }
     case 'google-generative-ai':
       return {
-        url: joinUrl(baseUrl, `/models${apiKey ? `?key=${encodeURIComponent(apiKey)}` : ''}`),
+        // 密钥统一放请求头，避免 URL 中携带旧分组密钥或把密钥写入访问日志。
+        url: joinUrl(baseUrl, '/models'),
         headers: {},
       }
     default: {
@@ -74,10 +63,34 @@ export function buildProviderModelsRequest(api: PiApi, baseUrl: string, apiKey: 
       const urls = openAiModelUrls(baseUrl)
       return {
         ...urls,
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: {},
       }
     }
   }
+}
+
+export function nextProviderModelsPage(api: PiApi, data: unknown, currentUrl: string): string | undefined {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined
+  const page = data as Record<string, unknown>
+  let token: unknown
+  let parameter: string
+  if (api === 'anthropic-messages') {
+    if (page.has_more === undefined || page.has_more === false) return undefined
+    if (page.has_more !== true) throw new Error('Anthropic 分页标记 has_more 必须是布尔值')
+    token = page.last_id
+    parameter = 'after_id'
+  } else if (api === 'google-generative-ai') {
+    if (page.nextPageToken === undefined || page.nextPageToken === '') return undefined
+    token = page.nextPageToken
+    parameter = 'pageToken'
+  } else {
+    return undefined
+  }
+  if (typeof token !== 'string' || !token.trim()) throw new Error('模型列表声明了后续页，但分页游标无效或缺失')
+  // 只把游标写入当前端点，不跟随网关给出的任意 URL，认证始终发往原供应商。
+  const next = new URL(currentUrl)
+  next.searchParams.set(parameter, token)
+  return next.toString()
 }
 
 // 解析各协议的列表响应

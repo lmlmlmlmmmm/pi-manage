@@ -1,8 +1,10 @@
-// models.dev 元数据补全（pi-switch 同款数据源）：
-// 按 id 匹配主流模型的 context window / 定价 / 图像输入 / reasoning，
-// 仅用于补全网关 /models 响应中缺失的字段，网关自带的信息优先。
+// models.dev 元数据补全：优先匹配当前供应商，无法确认时仅引用唯一的厂商资料。
+// 仅补全网关缺失的字段；资料价格不等于账户或中转站的实际费率。
 
-// models.dev api.json 的最小结构（203 个 provider → models 表）
+import type { ModelMeta, ModelMetaSource, PiApi } from '../src/types.js'
+import { outboundFetch } from './proxyFetch.js'
+
+// models.dev api.json 的最小结构（provider → models 表）
 // 网络请求经 outboundFetch（用户配置代理时走代理，绕开 TUN 兼容性问题）
 interface ModelsDevEntry {
   name?: string
@@ -12,24 +14,15 @@ interface ModelsDevEntry {
   cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number }
   // 思考档位来源（对齐 pi-switch）：type=="effort" 的 values 列出该模型支持的档位名
   reasoning_options?: { type?: string; values?: string[] }[]
+  provider?: { npm?: string; api?: string; shape?: string }
 }
 
-export interface ModelMeta {
-  contextWindow?: number
-  maxTokens?: number
-  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number }
-  inputImage?: boolean
-  reasoning?: boolean
-  name?: string
-  thinkingLevelMap?: Record<string, string | null>
-}
+export type { ModelMeta } from '../src/types.js'
 
 const API_URL = 'https://models.dev/api.json'
-import { outboundFetch } from './proxyFetch.js'
 
-// 同名模型跨多个 provider 时，优先取官方厂商条目（定价/参数权威），
-// 第三方中转（如 cortecs、ai-router）仅兜底，避免把中转商的价差写入配置
-const OFFICIAL_PROVIDERS = [
+// 中转商只在地址匹配时采用，不能作为其他中转商同名模型的默认资料。
+const OFFICIAL_PROVIDERS = new Set([
   'openai',
   'anthropic',
   'google',
@@ -44,14 +37,57 @@ const OFFICIAL_PROVIDERS = [
   'stepfun',
   'alibaba',
   'amazon',
-  'github-copilot',
-  'openrouter',
-]
+])
+
+// models.dev 的官方 SDK 条目省略 api 地址；其余供应商使用目录中的显式地址。
+const DEFAULT_ENDPOINTS: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com',
+  google: 'https://generativelanguage.googleapis.com/v1beta',
+  xai: 'https://api.x.ai/v1',
+  mistral: 'https://api.mistral.ai/v1',
+}
+const SDK_APIS: Record<string, PiApi[]> = {
+  '@ai-sdk/openai': ['openai-completions', 'openai-responses'],
+  '@ai-sdk/openai-compatible': ['openai-completions'],
+  '@openrouter/ai-sdk-provider': ['openai-completions'],
+  '@ai-sdk/anthropic': ['anthropic-messages'],
+  '@ai-sdk/google': ['google-generative-ai'],
+  '@ai-sdk/xai': ['openai-completions'],
+  '@ai-sdk/mistral': ['openai-completions'],
+}
+
+interface IndexedModel {
+  provider: string
+  id: string
+  entry: ModelsDevEntry
+  endpoint?: string
+  apis: PiApi[]
+}
+type ModelIndex = Map<string, IndexedModel[]>
+
+export interface ModelMetaLookupOptions {
+  api?: string
+  baseUrl?: string
+  proxyOverride?: string
+}
+
+function normalizedEndpoint(value?: string): string | undefined {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    // SDK 有的自行补 /v1；保留其余路径，避免把同域名下不同计费产品混为一谈。
+    return url.origin + url.pathname.replace(/\/+$/, '').replace(/\/v1(?:beta)?$/, '')
+  } catch {
+    // 目录中的区域/租户占位地址无法确认对应当前连接，不参与供应商匹配。
+    return undefined
+  }
+}
 
 // 会话内只拉取一次；失败后不缓存失败状态，下次导入可重试
-let indexPromise: Promise<Map<string, ModelsDevEntry>> | null = null
+let indexPromise: Promise<ModelIndex> | null = null
 
-function loadIndex(proxyOverride?: string): Promise<Map<string, ModelsDevEntry>> {
+function loadIndex(proxyOverride?: string): Promise<ModelIndex> {
   // 临时代理（代理页「测试」按钮）：单独发一次不污染进程缓存；
   // 索引已缓存时直接复用（常规路径可用，测试即通过）
   if (proxyOverride) {
@@ -62,38 +98,26 @@ function loadIndex(proxyOverride?: string): Promise<Map<string, ModelsDevEntry>>
   return indexPromise
 }
 
-async function buildIndex(proxyOverride?: string): Promise<Map<string, ModelsDevEntry>> {
+async function buildIndex(proxyOverride?: string): Promise<ModelIndex> {
   try {
     // 网络请求经 outboundFetch（用户配置/临时指定代理时走代理，绕开 TUN 兼容性问题）
     const res = await outboundFetch(API_URL, { signal: AbortSignal.timeout(15_000) }, proxyOverride)
     if (!res.ok) throw new Error(`models.dev HTTP ${res.status}`)
-    const data = (await res.json()) as Record<string, { models?: Record<string, ModelsDevEntry> }>
-    const index = new Map<string, ModelsDevEntry>()
-    const official = new Set(OFFICIAL_PROVIDERS)
-    // 两遍遍历：先收集官方 provider 的条目（优先），再补第三方兜底
-    for (const isOfficial of [true, false]) {
-      for (const [providerName, provider] of Object.entries(data)) {
-        if (official.has(providerName) !== isOfficial) continue
-        for (const [id, entry] of Object.entries(provider.models ?? {})) {
-          if (!index.has(id)) index.set(id, entry)
-        }
-      }
-    }
-    // 思考档位统一（对齐 pi-switch 的 enrich_reasoning）：同一模型跨 provider 的
-    // effort 选项常不完整，取全局最详细的一份覆盖到 index 条目，
-    // 使导入不依赖命中了哪家 listing
-    const best = new Map<string, ModelsDevEntry['reasoning_options']>()
-    for (const provider of Object.values(data)) {
+    const data = (await res.json()) as Record<string, { api?: string; npm?: string; models?: Record<string, ModelsDevEntry> }>
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('models.dev 返回的目录格式无效')
+    const index: ModelIndex = new Map()
+    // 同名模型保留各供应商原始条目，绝不拼接别家价格、能力或思考档位。
+    for (const [providerName, provider] of Object.entries(data)) {
       for (const [id, entry] of Object.entries(provider.models ?? {})) {
-        if (effortDetail(entry.reasoning_options) > effortDetail(best.get(id))) {
-          best.set(id, entry.reasoning_options)
+        const npm = entry.provider?.npm ?? provider.npm ?? ''
+        const apis = entry.provider?.shape === 'responses' ? ['openai-responses' as const] : SDK_APIS[npm] ?? []
+        const indexed: IndexedModel = {
+          provider: providerName, id, entry, apis,
+          endpoint: normalizedEndpoint(entry.provider?.api ?? provider.api ?? DEFAULT_ENDPOINTS[providerName]),
         }
-      }
-    }
-    for (const [id, options] of best) {
-      const entry = index.get(id)
-      if (entry && effortDetail(options) > effortDetail(entry.reasoning_options)) {
-        entry.reasoning_options = options
+        const entries = index.get(id) ?? []
+        entries.push(indexed)
+        index.set(id, entries)
       }
     }
     return index
@@ -105,13 +129,7 @@ async function buildIndex(proxyOverride?: string): Promise<Map<string, ModelsDev
   }
 }
 
-// effort 选项的详细度：values 中属于已知思考档位的档位名数量
 const GRADED_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'none'] as const
-
-function effortDetail(options: ModelsDevEntry['reasoning_options']): number {
-  const values = options?.find((o) => o.type === 'effort')?.values ?? []
-  return values.filter((v) => (GRADED_LEVELS as readonly string[]).includes(v)).length
-}
 
 // 按 pi-switch 规则生成 thinkingLevelMap：
 // reasoning 模型才有；graded 档位一个都不支持则整体不生成；
@@ -131,7 +149,7 @@ function buildThinkingLevelMap(entry: ModelsDevEntry): Record<string, string | n
   return map
 }
 
-function toMeta(entry: ModelsDevEntry): ModelMeta {
+function toMeta(entry: ModelsDevEntry, source: ModelMetaSource, includeThinking: boolean): ModelMeta {
   return {
     contextWindow: entry.limit?.context || undefined,
     maxTokens: entry.limit?.output || undefined,
@@ -143,26 +161,36 @@ function toMeta(entry: ModelsDevEntry): ModelMeta {
           cacheWrite: entry.cost.cache_write ?? undefined,
         }
       : undefined,
-    inputImage: entry.modalities?.input?.includes('image') || undefined,
-    reasoning: entry.reasoning === true || undefined,
+    inputImage: entry.modalities?.input?.includes('image'),
+    reasoning: entry.reasoning,
     name: entry.name,
-    thinkingLevelMap: buildThinkingLevelMap(entry),
+    thinkingLevelMap: includeThinking ? buildThinkingLevelMap(entry) : undefined,
+    source,
   }
 }
 
-// 精确匹配 → 失败则取 id 最后一段（openrouter/anthropic/claude-x → claude-x）
-// proxyOverride：临时代理（代理页「测试」按钮用），不影响正常请求的代理选择
-export async function lookupModelMeta(id: string, proxyOverride?: string): Promise<ModelMeta | null> {
-  let index: Map<string, ModelsDevEntry>
-  try {
-    index = await loadIndex(proxyOverride)
-  } catch (e) {
-    // 临时代理路径（代理页「测试」按钮）：失败必须上抛——测的就是代理连通性，
-    // 静默降级成 null 会让「网络不通」伪装成「未收录」
-    if (proxyOverride) throw e
-    // 元数据是锦上添花，网络失败静默降级为仅导入 id/name
-    return null
+export async function lookupModelMeta(id: string, opts: ModelMetaLookupOptions = {}): Promise<ModelMeta | null> {
+  // 网络错误上抛，不能把服务不可用误报成“未收录”。导入流程自行保留网关数据。
+  const index = await loadIndex(opts.proxyOverride)
+  const exact = index.get(id) ?? []
+  const parts = id.split('/')
+  const vendor = parts.length > 1 ? parts[parts.length - 2]! : ''
+  // 只识别明确的厂商前缀，不再任意截取末段，避免同名私有模型被错误补全。
+  const aliases = OFFICIAL_PROVIDERS.has(vendor)
+    ? (index.get(parts[parts.length - 1]!) ?? []).filter((entry) => entry.provider === vendor)
+    : []
+  const endpoint = normalizedEndpoint(opts.baseUrl)
+  const matched = endpoint ? exact.filter((entry) => entry.endpoint === endpoint) : []
+  const compatible = matched.filter((entry) => entry.apis.includes(opts.api as PiApi))
+  const candidates = compatible.length ? compatible : matched
+  let hit = candidates.length === 1 ? candidates[0] : undefined
+  const match: ModelMetaSource['match'] = hit ? 'provider' : 'reference'
+  if (!hit) {
+    const official = aliases.length ? aliases : exact.filter((entry) => OFFICIAL_PROVIDERS.has(entry.provider))
+    // 同名但厂商不唯一时不猜测；保留用户值，允许手工填写。
+    if (official.length === 1) hit = official[0]
   }
-  const hit = index.get(id) ?? (id.includes('/') ? index.get(id.split('/').pop()!) : undefined)
-  return hit ? toMeta(hit) : null
+  if (!hit) return null
+  return toMeta(hit.entry, { provider: hit.provider, modelId: hit.id, match },
+    match === 'provider' && hit.apis.includes(opts.api as PiApi))
 }

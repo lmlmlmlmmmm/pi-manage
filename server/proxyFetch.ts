@@ -312,7 +312,11 @@ function requestThroughTunnel(
 ): Promise<ProxiedFetchResult> {
   return new Promise((resolve, reject) => {
     let settled = false
-    const tlsSocket = tlsConnect({ socket, servername: target.hostname })
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      reject(new Error(`代理隧道内错误：${error.message}`, { cause: error }))
+    }
     const headers = { ...opts.headers }
     if (opts.body !== undefined && !Object.keys(headers).some((key) => key.toLowerCase() === 'content-length')) {
       headers['Content-Length'] = String(Buffer.byteLength(opts.body))
@@ -322,13 +326,15 @@ function requestThroughTunnel(
       {
         method: opts.method ?? 'GET',
         headers,
-        agent: false,
-        createConnection: () => tlsSocket,
+        // 自定义连接时必须省略 agent：agent: false 会创建新 Agent，绕过隧道重新直连。
+        createConnection: () => tlsConnect({ socket, servername: target.hostname }),
         signal: opts.signal,
       },
       (response) => {
         const chunks: Buffer[] = []
         response.on('data', (chunk: Buffer) => chunks.push(chunk))
+        // 响应中途断开会触发 error 而非 end，必须结束等待，避免悬挂请求。
+        response.on('error', fail)
         response.on('end', () => {
           if (settled) return
           settled = true
@@ -344,11 +350,7 @@ function requestThroughTunnel(
       },
     )
     request.setTimeout(60_000, () => request.destroy(new Error('代理隧道内请求超时')))
-    request.on('error', (error) => {
-      if (settled) return
-      settled = true
-      reject(new Error(`代理隧道内错误：${error.message}`))
-    })
+    request.on('error', fail)
     request.end(opts.body)
   })
 }
@@ -382,11 +384,13 @@ export async function outboundFetch(
   const onAbort = () => socket.destroy(new Error('请求已中止'))
   opts.signal?.addEventListener('abort', onAbort, { once: true })
   try {
+    opts.signal?.throwIfAborted()
     if (proxy.protocol === 'socks5:') {
       await establishSocks5Tunnel(socket, proxy, target.hostname, Number(target.port || 443))
     } else {
       await establishHttpTunnel(socket, proxy, target.hostname, Number(target.port || 443))
     }
+    opts.signal?.throwIfAborted()
     return await requestThroughTunnel(socket, target, opts)
   } catch (e) {
     socket.destroy()

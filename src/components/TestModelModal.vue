@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import type { PiModel, PiProvider, TestModelResult } from '../types'
+import { isAuthHeader, providerAuthNotice } from '../lib/modelAuth'
 
 // 模型连接测试：提示词仅随本次请求发送，不写配置；结果按连接阶段在终端区展示。
 
@@ -19,6 +20,8 @@ const DEFAULT_PROMPT = '使用python写一个二分法，不要写入文件'
 
 const prompt = ref(DEFAULT_PROMPT)
 const submittedPrompt = ref('')
+const stream = ref(true)
+const submittedStream = ref(true)
 const testing = ref(false)
 const result = ref<TestModelResult | null>(null)
 const consoleEl = ref<HTMLElement | null>(null)
@@ -27,6 +30,7 @@ let requestVersion = 0
 
 const effectiveApi = computed(() => props.model?.api ?? props.provider?.api ?? '未设置')
 const actionLabel = computed(() => (result.value ? '重新测试' : '开始测试'))
+const authNotice = computed(() => providerAuthNotice(props.provider, Object.keys(props.model?.headers ?? {}).some(isAuthHeader)))
 
 watch(
   () => props.show,
@@ -37,6 +41,7 @@ watch(
     }
     cancelRequest()
     prompt.value = DEFAULT_PROMPT
+    stream.value = true
     submittedPrompt.value = ''
     result.value = null
   },
@@ -48,6 +53,8 @@ function cancelRequest() {
   requestController = null
   testing.value = false
 }
+
+onScopeDispose(cancelRequest)
 
 async function scrollConsoleToEnd() {
   await nextTick()
@@ -64,6 +71,7 @@ async function run() {
   const message = prompt.value.trim() || DEFAULT_PROMPT
   prompt.value = message
   submittedPrompt.value = message
+  submittedStream.value = stream.value
   result.value = null
   testing.value = true
   await scrollConsoleToEnd()
@@ -76,6 +84,8 @@ async function run() {
         provider: props.provider,
         model: props.model,
         prompt: message,
+        stream: submittedStream.value,
+        providerName: props.providerName,
       }),
       signal: controller.signal,
     })
@@ -117,7 +127,8 @@ function updateShow(show: boolean) {
     :show="props.show"
     preset="card"
     title="测试模型连接"
-    :style="{ width: 'min(680px, calc(100vw - 24px))' }"
+    :style="{ width: 'min(680px, calc(100vw - 24px))', maxHeight: 'calc(100vh - 48px)' }"
+    :content-style="{ overflowY: 'auto', minHeight: '0' }"
     :mask-closable="false"
     @update:show="updateShow"
   >
@@ -132,6 +143,11 @@ function updateShow(show: boolean) {
       <n-tag size="small" :bordered="false">{{ effectiveApi }}</n-tag>
     </div>
 
+    <n-alert class="tm-auth-notice" :type="authNotice.type" :show-icon="false">{{ authNotice.text }}</n-alert>
+    <div class="tm-test-options">
+      <n-checkbox v-model:checked="stream" :disabled="testing">流式测试（与 pi 一致）</n-checkbox>
+      <span class="muted">关闭后测试普通 JSON 对话；结果在响应结束后展示。</span>
+    </div>
     <label class="tm-prompt-label" for="tm-test-prompt">测试提示词</label>
     <n-input
       v-model:value="prompt"
@@ -165,6 +181,10 @@ function updateShow(show: boolean) {
           <span class="tm-log-success">{{ effectiveApi }}</span>
         </div>
         <div class="tm-log-line">
+          <span class="tm-log-key">测试模式:</span>
+          <span>{{ (result?.stream ?? submittedStream) ? '流式对话' : '普通对话' }}</span>
+        </div>
+        <div class="tm-log-line">
           <span class="tm-log-key">使用模型:</span>
           <span class="tm-log-info">{{ props.model?.id }}</span>
         </div>
@@ -179,7 +199,7 @@ function updateShow(show: boolean) {
             <span class="tm-log-value">{{ result.url }}</span>
           </div>
           <div v-if="result.ok" class="tm-log-line tm-log-success">
-            连接成功，耗时 {{ result.ms }} ms
+            {{ (result.stream ?? submittedStream) ? '流式对话测试通过' : '普通对话测试通过' }}，耗时 {{ result.ms }} ms
           </div>
           <div v-else class="tm-log-line tm-log-error">测试失败，耗时 {{ result.ms }} ms</div>
 
@@ -213,6 +233,19 @@ function updateShow(show: boolean) {
 </template>
 
 <style scoped>
+.tm-auth-notice,
+.tm-test-options {
+  margin-bottom: 12px;
+}
+
+.tm-test-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 12px;
+}
+
 .tm-summary {
   display: flex;
   align-items: center;

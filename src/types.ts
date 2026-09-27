@@ -2,7 +2,7 @@
 // 字段语义以 pi 官方文档 models.md / settings.md 为准。
 // 所有对象带索引签名：工具未识别的字段在保存时原样保留（无损写入）。
 
-// pi 支持的四种 API 协议
+// 本工具提供编辑选项和连接测试的四种 API 协议。
 export type PiApi =
   | 'openai-completions'
   | 'openai-responses'
@@ -76,24 +76,38 @@ export interface PiLibrary {
 // 库与 models.json 的差异项：外部工具（pi-switch / cc-switch / 手动编辑）改过投影后，
 // 加载时列出供用户一键处理
 export interface ProviderDiff {
-  kind: 'external-added' | 'external-removed'
+  kind: 'external-added' | 'external-removed' | 'external-modified'
   name: string
   modelCount: number
-  /** external-added 时携带 models.json 中的原始配置快照，供「导入到库」 */
+  /** 外部新增或修改时携带 models.json 快照，供用户明确选择采用 */
   config?: PiProvider
+}
+
+export interface LoadedState {
+  library: PiLibrary
+  settings: PiSettings
+  diffs: ProviderDiff[]
+  warnings: string[]
+  piDir: string
+  /** 完整库与启用投影的版本；settings 仍独立进行三方合并 */
+  revision: string
 }
 
 export interface SaveResult {
   ok: boolean
   errors: string[]
   written: string[]
+  /** 外部修改或过期页面必须重新加载后才能保存 */
+  conflict?: boolean
+  /** 保存成功后的磁盘版本 */
+  revision?: string
   /** 合并外部变更后的最终 settings（保存成功时返回，前端据此刷新编辑状态与合并基线） */
   settings?: PiSettings
   /** 保存时检测到并被保留的 settings.json 外部变更字段（pi 等工具在页面打开期间写入） */
   externalSettingsKeys?: string[]
 }
 
-// 模型连接测试结果（后端按 pi 实际请求语义发送完整对话请求）
+// 基础对话测试结果；不代表 pi 登录或完整工具会话已经验证。
 export interface TestModelResult {
   ok: boolean
   ms: number
@@ -102,9 +116,18 @@ export interface TestModelResult {
   reply?: string
   error?: string
   url: string
+  /** 本次实际采用的测试模式；旧服务未返回时由前端保留提交时的模式。 */
+  stream?: boolean
 }
 
 // models.dev 元数据（编辑表单「获取元数据」/ 在线导入补全）
+export interface ModelMetaSource {
+  provider: string
+  modelId: string
+  /** 地址匹配当前供应商，或仅引用模型厂商资料；均不代表实际账单价格。 */
+  match: 'provider' | 'reference'
+}
+
 export interface ModelMeta {
   contextWindow?: number
   maxTokens?: number
@@ -113,6 +136,7 @@ export interface ModelMeta {
   reasoning?: boolean
   name?: string
   thinkingLevelMap?: Record<string, string | null>
+  source?: ModelMetaSource
 }
 
 // 在线导入拉取到的模型（网关自带 + models.dev 补全的元数据）
@@ -125,6 +149,9 @@ export interface FetchedModel {
   inputImage?: boolean
   reasoning?: boolean
   thinkingLevelMap?: Record<string, string | null>
+  /** 仅供导入界面展示，保存 PiModel 时不写入 pi 配置。 */
+  metadataSource?: ModelMetaSource
+  referenceCost?: boolean
 }
 
 // pi-manage 自身应用配置（代理等，存 ~/.pi/agent/.pi-manage/config.json，与 pi settings 无关）

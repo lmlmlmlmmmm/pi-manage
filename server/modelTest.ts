@@ -1,66 +1,24 @@
-// 模型连接测试：按 pi 实际请求语义构造一次完整对话请求（Node 代发，可带 UA 等自定义 headers）。
-// 请求构造对齐 pi 源码（pi-ai provider-composer / 各协议 client）：
+// 基础对话测试：对齐 pi 0.87.1 的端点、认证和兼容参数；不替代 pi 的登录、工具调用或完整会话验证。
+// 请求构造参考 pi-ai provider-composer / 各协议 client：
 // - baseUrl 取 model.baseUrl ?? provider.baseUrl，先去尾斜杠再拼端点路径
-// - headers 浅合并：provider.headers ← model.headers（模型级覆盖同键）
+// - headers 忽略大小写合并：provider.headers ← model.headers（模型级覆盖同名头）
 // - 认证：apiKey 支持 $ENV / ${ENV} 模板与 !command 语法（与 pi 的 resolve-config-value 同语义）；
-//   openai/google 用 Bearer / x-goog-api-key，anthropic 用 x-api-key（authHeader 时 Bearer）
-// - google 端点为 {base}/v1beta/models/{id}:generateContent（SDK 默认补 v1beta 版本段）
+//   openai/google 用 Bearer / x-goog-api-key，anthropic 用 x-api-key；authHeader 会同时附加 Bearer
+// - google 的 baseUrl 由用户提供完整版本路径，与 pi 一样直接拼接 models 端点
 
-import { execSync } from 'node:child_process'
-import type { PiApi, PiModel, PiProvider } from '../src/types.js'
+import type { PiApi, PiModel, PiProvider, TestModelResult } from '../src/types.js'
+import { PI_API_OPTIONS } from '../src/types.js'
+import { mergeHeaders } from '../src/lib/modelAuth.js'
 import { outboundFetch } from './proxyFetch.js'
+import { resolveRequestHeaders } from './requestAuth.js'
+import { validate } from './config.js'
+import { readModelResponse, responseError } from './modelResponse.js'
 
-export interface TestModelResult {
-  ok: boolean
-  /** 请求耗时（毫秒） */
-  ms: number
-  /** 本次实际发送的测试消息（回显给前端展示） */
-  prompt?: string
-  /** 成功时的完整模型回复 */
-  reply?: string
-  /** 失败时的错误信息（HTTP 状态 + 网关错误详情） */
-  error?: string
-  /** 实际请求的完整 URL（脱敏后展示给用户核对端点） */
-  url: string
-}
+export type { TestModelResult } from '../src/types.js'
 
 // 连接测试需要看到可读的真实回复；2048 足以覆盖常见代码回答，同时限制意外 quota 消耗。
 const TEST_MAX_OUTPUT_TOKENS = 2048
 const TEST_TIMEOUT_MS = 60_000
-
-// ---------- $ENV / !command 值解析（对齐 pi resolve-config-value） ----------
-
-// 模板语法：$VAR / ${VAR} 内插环境变量；$$ 与 $! 是字面量转义
-function resolveTemplate(config: string): string | undefined {
-  const parts = config.split(/(\$\$|\$!|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)/)
-  let out = ''
-  for (const part of parts) {
-    if (!part) continue
-    if (part === '$$') out += '$'
-    else if (part === '$!') out += '!'
-    else if (part.startsWith('${') && part.endsWith('}')) {
-      const v = process.env[part.slice(2, -1)]
-      if (v === undefined) return undefined
-      out += v
-    } else if (part.startsWith('$')) {
-      const v = process.env[part.slice(1)]
-      if (v === undefined) return undefined
-      out += v
-    } else out += part
-  }
-  return out
-}
-
-// !command 用系统 shell 执行取 stdout（pi 在 win 用配置 shell，这里简化为默认 shell，语义一致）
-function resolveConfigValue(value: string): string | undefined {
-  if (!value.startsWith('!')) return resolveTemplate(value)
-  try {
-    const out = execSync(value.slice(1), { encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })
-    return out.trim() || undefined
-  } catch {
-    return undefined
-  }
-}
 
 // ---------- 请求构造 ----------
 
@@ -68,112 +26,85 @@ function trimBase(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '')
 }
 
-function hasHeader(headers: Record<string, string>, name: string): boolean {
-  const lower = name.toLowerCase()
-  return Object.entries(headers).some(([k, v]) => k.toLowerCase() === lower && v && v.trim().length > 0)
-}
-
 interface TestRequest {
   url: string
   headers: Record<string, string>
   body: Record<string, unknown>
+  compat: Record<string, unknown>
 }
 
-function buildTestRequest(api: PiApi, provider: PiProvider, model: PiModel, prompt: string): TestRequest {
-  // 合并语义与 pi 一致：模型级 baseUrl 覆盖 provider；headers 浅合并（模型级同键胜出）
+function buildTestRequest(api: PiApi, provider: PiProvider, model: PiModel, prompt: string, stream: boolean, providerName = ''): TestRequest {
   const baseUrl = trimBase(model.baseUrl || provider.baseUrl || '')
-  const headers: Record<string, string> = { ...(provider.headers ?? {}), ...(model.headers ?? {}) }
-  // 解析 $ENV / !command 后的 apiKey；headers 值同样支持该语法
-  const rawKey = provider.apiKey ?? ''
-  const apiKey = rawKey ? resolveConfigValue(rawKey) ?? '' : ''
-  for (const [k, v] of Object.entries(headers)) {
-    const resolved = resolveConfigValue(v)
-    if (resolved !== undefined) headers[k] = resolved
-    else delete headers[k]
+  const parsedUrl = new URL(baseUrl)
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('测试地址仅支持 HTTP / HTTPS')
+  const override = provider.modelOverrides?.[model.id]
+  // 元数据覆盖最后生效；认证头沿用 pi 的顺序：modelOverrides → models → Provider 合并。
+  const compat = { ...provider.compat, ...model.compat, ...(override?.compat as Record<string, unknown> | undefined) }
+  for (const key of ['openRouterRouting', 'vercelGatewayRouting', 'chatTemplateKwargs', 'chatTemplateArgs']) {
+    const layers = [provider.compat?.[key], model.compat?.[key], (override?.compat as Record<string, unknown> | undefined)?.[key]]
+    if (layers.some((value) => value !== undefined)) compat[key] = Object.assign({}, ...layers)
   }
-  // 认证规则（对齐 pi）：headers 已含认证头时不再自动附加；否则按协议附加
-  const hasAuth = hasHeader(headers, 'authorization') || hasHeader(headers, 'x-api-key') || hasHeader(headers, 'x-goog-api-key')
+  const headers = resolveRequestHeaders(api, provider, mergeHeaders(override?.headers as Record<string, string> | undefined, model.headers))
+  const maxTokens = Math.min(TEST_MAX_OUTPUT_TOKENS, (override?.maxTokens as number | undefined) ?? model.maxTokens ?? TEST_MAX_OUTPUT_TOKENS)
+  // pi 0.87.1 只有 OpenAI 系列适配器读取 samplingParams；Anthropic / Google 不额外发送此字段。
+  const sampling = api.startsWith('openai-') ? { ...model.samplingParams, ...(override?.samplingParams as Record<string, unknown> | undefined) } : {}
+  // 测试必须使用界面选定的模型、提示词和模式，不能由扩展采样字段悄悄改测其他内容。
+  for (const field of ['model', 'messages', 'input', 'contents', 'stream']) {
+    if (field in sampling) throw new Error(`samplingParams.${field} 会覆盖测试目标或模式，本工具无法验证此配置`)
+  }
   const id = model.id
+  let url: string
+  let body: Record<string, unknown>
   switch (api) {
     case 'anthropic-messages':
-      if (!hasAuth) {
-        if (provider.authHeader) {
-          if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
-        } else if (apiKey) {
-          headers['x-api-key'] = apiKey
-        }
-        headers['anthropic-version'] = headers['anthropic-version'] ?? '2023-06-01'
+      // 使用模型独立认证时仍需版本头；它与密钥来源无关。
+      if (!Object.keys(headers).some((name) => name.toLowerCase() === 'anthropic-version')) {
+        headers['anthropic-version'] = '2023-06-01'
       }
-      return {
-        url: `${baseUrl}/v1/messages`,
-        headers,
-        body: {
-          model: id,
-          max_tokens: TEST_MAX_OUTPUT_TOKENS,
-          messages: [{ role: 'user', content: prompt }],
-        },
-      }
+      // pi 使用 Anthropic beta.messages 客户端；查询参数也是实际请求的一部分。
+      url = `${baseUrl}/v1/messages?beta=true`
+      body = { model: id, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }], stream, ...sampling }
+      break
     case 'google-generative-ai':
-      if (!hasAuth && apiKey) headers['x-goog-api-key'] = apiKey
-      return {
-        // SDK 语义：baseUrl 去尾斜杠 + v1beta 版本段 + models/{id}:generateContent
-        url: `${baseUrl}/v1beta/models/${id}:generateContent`,
-        headers,
-        body: {
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: TEST_MAX_OUTPUT_TOKENS },
-        },
+      // Pi 指定 baseUrl 后不再补版本段；流式端点通过 alt=sse 返回事件流。
+      url = `${baseUrl}/models/${id}:${stream ? 'streamGenerateContent?alt=sse' : 'generateContent'}`
+      body = {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: maxTokens, ...sampling },
       }
+      break
     case 'openai-responses':
-      if (!hasAuth && apiKey) headers['Authorization'] = `Bearer ${apiKey}`
-      return {
-        url: `${baseUrl}/responses`,
-        headers,
-        body: { model: id, input: prompt, max_output_tokens: TEST_MAX_OUTPUT_TOKENS },
-      }
-    default:
-      // openai-completions
-      if (!hasAuth && apiKey) headers['Authorization'] = `Bearer ${apiKey}`
-      return {
-        url: `${baseUrl}/chat/completions`,
-        headers,
-        body: {
-          model: id,
-          max_tokens: TEST_MAX_OUTPUT_TOKENS,
-          messages: [{ role: 'user', content: prompt }],
-        },
-      }
+      url = `${baseUrl}/responses`
+      body = { model: id, input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }], stream, store: false }
+      if (compat.supportsMaxOutputTokens !== false) body.max_output_tokens = Math.max(16, maxTokens)
+      Object.assign(body, sampling)
+      break
+    case 'openai-completions': {
+      // 使用 pi 的常见厂商/地址检测作为默认值，显式 compat 始终优先。
+      const legacyTokens = ['zai', 'zai-coding-cn', 'together', 'moonshotai', 'moonshotai-cn', 'cloudflare-ai-gateway', 'nvidia', 'ant-ling', 'deepseek'].includes(providerName) ||
+        ['api.z.ai', 'open.bigmodel.cn', 'api.together.ai', 'api.together.xyz', 'api.moonshot.', 'gateway.ai.cloudflare.com', 'integrate.api.nvidia.com', 'api.ant-ling.com', 'chutes.ai'].some((host) => baseUrl.includes(host)) || baseUrl.toLowerCase().includes('deepseek.com')
+      const nonStandard = legacyTokens || ['cerebras', 'xai', 'opencode', 'cloudflare-workers-ai'].includes(providerName) ||
+        ['cerebras.ai', 'api.x.ai', 'opencode.ai', 'api.cloudflare.com'].some((host) => baseUrl.includes(host))
+      const maxTokensField = (compat.maxTokensField as string | undefined) ?? (legacyTokens ? 'max_tokens' : 'max_completion_tokens')
+      url = `${baseUrl}/chat/completions`
+      body = { model: id, messages: [{ role: 'user', content: prompt }], stream, [maxTokensField]: maxTokens }
+      if (stream && compat.supportsUsageInStreaming !== false) body.stream_options = { include_usage: true }
+      if (compat.supportsStore ?? !nonStandard) body.store = false
+      if (compat.openRouterRouting) body.provider = compat.openRouterRouting
+      if (compat.vercelGatewayRouting) body.providerOptions = { gateway: compat.vercelGatewayRouting }
+      Object.assign(body, sampling)
+      break
+    }
   }
-}
-
-// ---------- 响应解析 ----------
-
-// 各协议的成功/错误响应形状不同，统一抽出回复文本与错误信息
-function extractReply(api: PiApi, data: unknown): string | undefined {
-  if (api === 'google-generative-ai') {
-    const candidates = (data as { candidates?: { content?: { parts?: { text?: string }[] } }[] })?.candidates
-    return candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') || undefined
+  // 用户采样参数仍按 pi 的顺序覆盖；超出测试额度时明确拒绝，避免意外发出高额度请求。
+  const tokenFields = api === 'google-generative-ai' ? body.generationConfig as Record<string, unknown> : body
+  for (const field of ['max_tokens', 'max_completion_tokens', 'max_output_tokens', 'maxOutputTokens']) {
+    const value = tokenFields[field]
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > TEST_MAX_OUTPUT_TOKENS)) {
+      throw new Error(`测试请求的 ${field} 必须大于 0 且不超过 ${TEST_MAX_OUTPUT_TOKENS}`)
+    }
   }
-  if (api === 'openai-responses') {
-    const output = (data as { output?: { content?: { text?: string }[] }[] })?.output
-    return output?.map((o) => o.content?.map((c) => c.text ?? '').join('') ?? '').join('') || undefined
-  }
-  if (api === 'anthropic-messages') {
-    const content = (data as { content?: { text?: string }[] })?.content
-    return content?.map((c) => c.text ?? '').join('') || undefined
-  }
-  const choices = (data as { choices?: { message?: { content?: string } }[] })?.choices
-  return choices?.[0]?.message?.content || undefined
-}
-
-function extractError(data: unknown, text: string): string {
-  // OpenAI/Google 风格 {error:{message}}；Anthropic {type:"error",error:{message,type}}；兜底原文
-  const e = data as { error?: { message?: string; type?: string } | string; type?: string }
-  if (e?.error) {
-    if (typeof e.error === 'string') return e.error
-    if (e.error.message) return e.error.type ? `(${e.error.type}) ${e.error.message}` : e.error.message
-  }
-  return text.slice(0, 300)
+  return { url, headers, body, compat }
 }
 
 // ---------- 入口 ----------
@@ -181,6 +112,12 @@ function extractError(data: unknown, text: string): string {
 export interface TestModelOptions {
   /** 自定义测试消息（仅本次请求生效，不落盘）；缺省用内置默认 */
   prompt?: string
+  /** 默认测试 pi 使用的流式对话；可显式关闭以排查普通 JSON 响应。 */
+  stream?: boolean
+  /** 用于匹配 pi 的已知厂商兼容默认值，不用于读取凭据。 */
+  providerName?: string
+  /** 浏览器断开连接时同步中止上游，避免继续生成无人接收的回复。 */
+  signal?: AbortSignal
 }
 
 export async function testModel(
@@ -188,49 +125,43 @@ export async function testModel(
   model: PiModel,
   opts: TestModelOptions = {},
 ): Promise<TestModelResult> {
-  const api: PiApi = (model.api ?? provider.api) as PiApi
-  if (!api) {
-    return { ok: false, ms: 0, error: '缺少 API 协议：请先在 provider 或模型上设置 api', url: '' }
+  const api = model.api ?? provider.api
+  const stream = opts.stream ?? true
+  if (!api || !PI_API_OPTIONS.some((item) => item.value === api)) {
+    return { ok: false, ms: 0, error: api ? `本工具暂不支持测试协议：${api}` : '测试需要显式指定 API 协议；pi 内置或扩展的继承值无法在此确认', url: '', stream }
   }
   if (!provider.baseUrl && !model.baseUrl) {
-    return { ok: false, ms: 0, error: '缺少 baseUrl', url: '' }
+    return { ok: false, ms: 0, error: '测试需要显式指定 baseUrl；pi 内置或扩展的继承值无法在此确认', url: '', stream }
   }
-  // apiKey/headers 含 $ENV/!command 时可能解析失败：提前报可定位错误，而不是发出去 401
-  if (provider.apiKey && !provider.apiKey.startsWith('!') && resolveConfigValue(provider.apiKey) === undefined) {
-    return { ok: false, ms: 0, error: `apiKey 中的环境变量未定义：${provider.apiKey}`, url: '' }
-  }
-  // 测试消息可由调用方自定义（仅本次请求生效，不落盘）；输出上限固定为 2048 token，
-  // 既能核对真实回复，又避免连接测试意外消耗过多 quota。
   const prompt = opts.prompt?.trim() || '使用python写一个二分法，不要写入文件'
-  const { url, headers, body } = buildTestRequest(api, provider, model, prompt)
   const start = Date.now()
+  let url = ''
   try {
+    opts.signal?.throwIfAborted()
+    const errors = validate({ providers: { [opts.providerName || '当前测试']: { enabled: true, config: { ...provider, models: [model] } } } })
+    if (errors.length) throw new Error(errors.join('；'))
+    const request = buildTestRequest(api, provider, model, prompt, stream, opts.providerName)
+    url = request.url
     const res = await outboundFetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
+      headers: { 'Content-Type': 'application/json', ...request.headers },
+      body: JSON.stringify(request.body),
+      signal: opts.signal
+        ? AbortSignal.any([opts.signal, AbortSignal.timeout(TEST_TIMEOUT_MS)])
+        : AbortSignal.timeout(TEST_TIMEOUT_MS),
     })
-    const ms = Date.now() - start
     const text = await res.text()
-    let data: unknown = null
-    try {
-      data = JSON.parse(text)
-    } catch {
-      data = null
-    }
     if (!res.ok) {
-      return { ok: false, ms, error: `HTTP ${res.status}：${data ? extractError(data, text) || text.slice(0, 200) : text.slice(0, 200) || '(空响应)'}`, url }
+      let detail = text.slice(0, 300)
+      try { detail = responseError(JSON.parse(text)) ?? detail }
+      catch { /* HTTP 错误可能返回 HTML；保留状态码和有限原文用于排查。 */ }
+      return { ok: false, ms: Date.now() - start, error: `HTTP ${res.status}：${detail || '(空响应)'}`, url, stream }
     }
-    // HTTP 200 但网关可能返回带 error 字段的伪成功响应（one-api 常见），一并识别
-    if (data && typeof data === 'object' && 'error' in (data as Record<string, unknown>) && (data as Record<string, unknown>).error) {
-      return { ok: false, ms, error: `网关返回错误：${extractError(data, text)}`, url }
-    }
-    return { ok: true, ms, prompt, reply: extractReply(api, data), url }
+    const reply = readModelResponse(api, text, stream, request.compat)
+    return { ok: true, ms: Date.now() - start, prompt, reply, url, stream }
   } catch (e) {
-    const ms = Date.now() - start
     const err = e as Error
-    const reason = err.name === 'TimeoutError' ? '请求超时（60 秒）' : err.message
-    return { ok: false, ms, error: reason, url }
+    const reason = opts.signal?.aborted ? '测试已取消' : err.name === 'TimeoutError' ? '请求超时（60 秒）' : err.message
+    return { ok: false, ms: Date.now() - start, error: reason, url, stream }
   }
 }

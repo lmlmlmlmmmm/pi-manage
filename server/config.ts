@@ -3,21 +3,24 @@
 // 定位 ~/.pi/agent（或 PI_CODING_AGENT_DIR），不再受浏览器沙箱限制。
 
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { PiLibrary, PiModelsFile, PiProvider, PiSettings, ProviderDiff, SaveResult } from '../src/types.js'
+import { isDeepStrictEqual } from 'node:util'
+import type { LoadedState, PiLibrary, PiModelsFile, PiProvider, PiSettings, ProviderDiff, SaveResult } from '../src/types.js'
 
 const MODELS_FILE = 'models.json'
 const SETTINGS_FILE = 'settings.json'
 const LIBRARY_DIR = '.pi-manage'
 const LIBRARY_FILE = 'providers.json'
 
-export interface LoadedState {
-  library: PiLibrary
-  settings: PiSettings
-  diffs: ProviderDiff[]
-  warnings: string[]
-  piDir: string
+const CONFIG_FILES = [`${LIBRARY_DIR}/${LIBRARY_FILE}`, MODELS_FILE, SETTINGS_FILE]
+
+export type { LoadedState } from '../src/types.js'
+
+function configRevision(contents: (string | null)[]): string {
+  // 只锁定完整库与启用投影；pi CLI 对 settings 的独立修改继续走三方合并。
+  return createHash('sha256').update(JSON.stringify(contents.slice(0, 2))).digest('hex')
 }
 
 function agentDir(): string {
@@ -26,10 +29,22 @@ function agentDir(): string {
   return join(homedir(), '.pi', 'agent')
 }
 
-function readJson<T>(file: string, label: string): T | null {
+function readJson<T>(file: string, label: string, allowComments = false): T | null {
   if (!existsSync(file)) return null
+  return parseJson<T>(readFileSync(file, 'utf-8'), label, allowComments)
+}
+
+function parseJson<T>(content: string | null, label: string, allowComments = false): T | null {
+  if (content === null) return null
   try {
-    return JSON.parse(readFileSync(file, 'utf-8')) as T
+    let source = content.replace(/^\uFEFF/, '')
+    // pi 仅对 models.json 接受行注释和尾逗号；字符串里的 URL、// 和逗号必须原样保留。
+    if (allowComments) {
+      source = source
+        .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => match[0] === '"' ? match : '')
+        .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail: string | undefined) => tail ?? match)
+    }
+    return JSON.parse(source) as T
   } catch (e) {
     throw new Error(`${label} 不是合法 JSON：${(e as Error).message}`)
   }
@@ -87,13 +102,15 @@ function normalizeLibraryCosts(library: PiLibrary): number {
   return normalizeProviderCosts(providers)
 }
 
-function validateCost(errors: string[], modelLabel: string, value: unknown): void {
+function validateCost(errors: string[], modelLabel: string, value: unknown, partial = false): void {
   if (value === undefined) return
   if (!isRecord(value)) {
     errors.push(`${modelLabel}的 cost 必须是对象`)
     return
   }
   for (const key of COST_RATE_KEYS) {
+    // modelOverrides 的费率按字段继承，不能套用 models 中四项同时必填的规则。
+    if (partial && value[key] === undefined) continue
     if (typeof value[key] !== 'number' || !Number.isFinite(value[key])) {
       errors.push(`${modelLabel}的 cost.${key} 必须是有效数字`)
     }
@@ -141,9 +158,14 @@ export function writeFileAtomic(file: string, content: string): void {
 
 export function loadState(): LoadedState {
   const dir = agentDir()
-  const models = readJson<PiModelsFile>(join(dir, MODELS_FILE), MODELS_FILE) ?? { providers: {} }
+  // 版本必须对应本次实际解析的字节；读取结束后重新取版本会把旧页面误认为已见过外部新内容。
+  const contents = CONFIG_FILES.slice(0, 2).map((name) => {
+    const file = join(dir, name)
+    return existsSync(file) ? readFileSync(file, 'utf-8') : null
+  })
+  const models = parseJson<PiModelsFile>(contents[1], MODELS_FILE, true) ?? { providers: {} }
   if (
-    typeof models !== 'object' ||
+    !isRecord(models) ||
     typeof models.providers !== 'object' ||
     models.providers === null ||
     Array.isArray(models.providers)
@@ -152,12 +174,13 @@ export function loadState(): LoadedState {
   }
   // 逐条校验 provider 值：null/非对象会让下方差异检测与首次导入直接 TypeError
   for (const [name, config] of Object.entries(models.providers)) {
-    if (typeof config !== 'object' || config === null) {
+    if (!isRecord(config)) {
       throw new Error(`${MODELS_FILE} 中 provider「${name}」的配置不是对象`)
     }
   }
   const modelsCostRepairs = normalizeProviderCosts(models.providers)
   const settings = readJson<PiSettings>(join(dir, SETTINGS_FILE), SETTINGS_FILE) ?? {}
+  if (!isRecord(settings)) throw new Error(`${SETTINGS_FILE} 结构异常：必须是对象`)
 
   const libFile = join(dir, LIBRARY_DIR, LIBRARY_FILE)
   let library: PiLibrary
@@ -165,7 +188,7 @@ export function loadState(): LoadedState {
   const warnings: string[] = []
   const diffs: ProviderDiff[] = []
 
-  if (!existsSync(libFile)) {
+  if (contents[0] === null) {
     // 首次运行：把现有 models.json 全量导入库，全部启用；库文件直接落盘
     const providers: PiLibrary['providers'] = {}
     for (const [name, config] of Object.entries(models.providers)) {
@@ -173,12 +196,13 @@ export function loadState(): LoadedState {
     }
     library = { providers }
     mkdirSync(join(dir, LIBRARY_DIR), { recursive: true })
-    writeFileAtomic(libFile, serialize(library))
+    contents[0] = serialize(library)
+    writeFileAtomic(libFile, contents[0])
   } else {
-    library = readJson<PiLibrary>(libFile, `${LIBRARY_DIR}/${LIBRARY_FILE}`) ?? { providers: {} }
+    library = parseJson<PiLibrary>(contents[0], `${LIBRARY_DIR}/${LIBRARY_FILE}`) ?? { providers: {} }
     // 库文件损坏时报可定位的错误（对齐 models.json 的处理），而不是后续流程里的 TypeError
     if (
-      typeof library !== 'object' ||
+      !isRecord(library) ||
       typeof library.providers !== 'object' ||
       library.providers === null ||
       Array.isArray(library.providers)
@@ -186,16 +210,22 @@ export function loadState(): LoadedState {
       throw new Error(`${LIBRARY_DIR}/${LIBRARY_FILE} 结构异常：缺少 providers 对象`)
     }
     for (const [name, lp] of Object.entries(library.providers)) {
-      if (typeof lp !== 'object' || lp === null || typeof lp.config !== 'object' || lp.config === null) {
+      if (!isRecord(lp) || !isRecord(lp.config)) {
         throw new Error(`${LIBRARY_DIR}/${LIBRARY_FILE} 中 provider「${name}」条目缺少 config 对象`)
       }
     }
     libraryCostRepairs = normalizeLibraryCosts(library)
-    if (libraryCostRepairs > 0) writeFileAtomic(libFile, serialize(library))
+    if (libraryCostRepairs > 0) {
+      contents[0] = serialize(library)
+      writeFileAtomic(libFile, contents[0])
+    }
     // 双向差异检测（对齐 pi-switch 同步语义）
     for (const [name, config] of Object.entries(models.providers)) {
-      if (!(name in library.providers)) {
+      if (!Object.hasOwn(library.providers, name)) {
         diffs.push({ kind: 'external-added', name, modelCount: config.models?.length ?? 0, config: clone(config) })
+      } else if (!library.providers[name].enabled || !isDeepStrictEqual(config, library.providers[name].config)) {
+        // 同名 provider 的模型、密钥等发生变化也需确认，避免任意一次自动保存覆盖外部编辑。
+        diffs.push({ kind: 'external-modified', name, modelCount: config.models?.length ?? 0, config: clone(config) })
       }
     }
     for (const [name, lp] of Object.entries(library.providers)) {
@@ -205,7 +235,10 @@ export function loadState(): LoadedState {
     }
   }
 
-  if (modelsCostRepairs > 0) writeFileAtomic(join(dir, MODELS_FILE), serialize(models))
+  if (modelsCostRepairs > 0) {
+    contents[1] = serialize(models)
+    writeFileAtomic(join(dir, MODELS_FILE), contents[1])
+  }
   if (modelsCostRepairs > 0 || libraryCostRepairs > 0) {
     const repaired = [
       modelsCostRepairs > 0 ? `${MODELS_FILE} ${modelsCostRepairs} 个` : '',
@@ -220,7 +253,7 @@ export function loadState(): LoadedState {
     warnings.push(`默认 provider「${settings.defaultProvider}」不在本地库中。`)
   }
 
-  return { library, settings, diffs, warnings, piDir: dir }
+  return { library, settings, diffs, warnings, piDir: dir, revision: configRevision(contents) }
 }
 
 // 启用子集投影：models.json 只写 enabled 的 provider
@@ -234,6 +267,112 @@ function projectModels(library: PiLibrary): PiModelsFile {
 
 // ---------- 校验与保存 ----------
 
+function validateHeaders(errors: string[], label: string, value: unknown): void {
+  if (value === undefined) return
+  if (!isRecord(value)) {
+    errors.push(`${label}.headers 必须是对象`)
+    return
+  }
+  for (const [name, header] of Object.entries(value)) {
+    if (typeof header !== 'string') errors.push(`${label}.headers[${name}] 必须是字符串`)
+  }
+}
+
+function validateCompat(errors: string[], label: string, value: unknown): void {
+  if (value === undefined) return
+  if (!isRecord(value)) {
+    errors.push(`${label}.compat 必须是对象`)
+    return
+  }
+  for (const key of [
+    'supportsStore', 'supportsDeveloperRole', 'supportsReasoningEffort', 'supportsUsageInStreaming',
+    'supportsFinishReason', 'requiresToolResultName', 'requiresAssistantAfterToolResult',
+    'requiresThinkingAsText', 'requiresReasoningContentOnAssistantMessages', 'supportsStrictMode',
+    'supportsOpenAIGrammarTools', 'sendSessionAffinityHeaders', 'supportsLongCacheRetention',
+    'supportsMaxOutputTokens', 'supportsEagerToolInputStreaming', 'supportsCacheControlOnTools',
+    'supportsTemperature', 'forceAdaptiveThinking', 'allowEmptySignature', 'supportsStrictTools',
+    'supportsMidConvoEffort',
+  ]) {
+    if (value[key] !== undefined && typeof value[key] !== 'boolean') errors.push(`${label}.compat.${key} 必须是布尔值`)
+  }
+  if (value.maxTokensField !== undefined && (typeof value.maxTokensField !== 'string' || !['max_tokens', 'max_completion_tokens'].includes(value.maxTokensField))) {
+    errors.push(`${label}.compat.maxTokensField 必须为 max_tokens 或 max_completion_tokens`)
+  }
+  for (const key of ['openRouterRouting', 'vercelGatewayRouting', 'chatTemplateKwargs', 'chatTemplateArgs']) {
+    if (value[key] !== undefined && !isRecord(value[key])) errors.push(`${label}.compat.${key} 必须是对象`)
+  }
+}
+
+function validateModelFields(errors: string[], label: string, model: Record<string, unknown>, override = false): void {
+  for (const key of override ? ['name'] : ['name', 'api', 'baseUrl']) {
+    if (model[key] !== undefined && (typeof model[key] !== 'string' || !model[key].trim())) {
+      errors.push(`${label}.${key} 必须是非空字符串`)
+    }
+  }
+  if (model.reasoning !== undefined && typeof model.reasoning !== 'boolean') errors.push(`${label}.reasoning 必须是布尔值`)
+  if (model.input !== undefined && (!Array.isArray(model.input) || model.input.some((input) => input !== 'text' && input !== 'image'))) {
+    errors.push(`${label}.input 必须是仅包含 text / image 的数组`)
+  }
+  for (const key of ['contextWindow', 'maxTokens']) {
+    const value = model[key]
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+      errors.push(`${label}.${key} 必须是大于 0 的有效数字；使用默认值请留空`)
+    }
+  }
+  if (model.thinkingLevelMap !== undefined) {
+    if (!isRecord(model.thinkingLevelMap)) errors.push(`${label}.thinkingLevelMap 必须是对象`)
+    else {
+      for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+        const value = model.thinkingLevelMap[level]
+        if (value !== undefined && value !== null && typeof value !== 'string') {
+          errors.push(`${label}.thinkingLevelMap.${level} 必须是字符串或 null`)
+        }
+      }
+    }
+  }
+  if (model.samplingParams !== undefined && !isRecord(model.samplingParams)) errors.push(`${label}.samplingParams 必须是对象`)
+  if (model.promptCache !== undefined) {
+    if (!isRecord(model.promptCache)) errors.push(`${label}.promptCache 必须是对象`)
+    else for (const tier of ['short', 'long']) {
+      const value = model.promptCache[tier]
+      if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+        errors.push(`${label}.promptCache.${tier} 必须是大于 0 的有效秒数`)
+      }
+    }
+  }
+  if (model.inputLimits !== undefined) {
+    if (!isRecord(model.inputLimits)) errors.push(`${label}.inputLimits 必须是对象`)
+    else {
+      const limits = model.inputLimits
+      const images = limits.images
+      const resize = isRecord(images) ? images.resize : undefined
+      if (images !== undefined && !isRecord(images)) errors.push(`${label}.inputLimits.images 必须是对象`)
+      if (resize !== undefined && !isRecord(resize)) errors.push(`${label}.inputLimits.images.resize 必须是对象`)
+      const fields: [string, unknown, number?][] = [
+        ['maxRequestBytes', limits.maxRequestBytes],
+        ...isRecord(images) ? [
+          ['images.maxPerMessage', images.maxPerMessage] as [string, unknown],
+          ['images.maxPerRequest', images.maxPerRequest] as [string, unknown],
+        ] : [],
+        ...isRecord(resize) ? [
+          ['images.resize.maxWidth', resize.maxWidth] as [string, unknown],
+          ['images.resize.maxHeight', resize.maxHeight] as [string, unknown],
+          ['images.resize.maxBytes', resize.maxBytes] as [string, unknown],
+          ['images.resize.jpegQuality', resize.jpegQuality, 100] as [string, unknown, number],
+        ] : [],
+      ]
+      for (const [key, value, max] of fields) {
+        if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || (max !== undefined && value > max))) {
+          errors.push(`${label}.inputLimits.${key} 必须是${max ? ` 1–${max} 范围内的` : ''}正整数`)
+        }
+      }
+    }
+  }
+  validateHeaders(errors, label, model.headers)
+  validateCompat(errors, label, model.compat)
+  validateCost(errors, label, model.cost, override)
+}
+
 export function validate(library: PiLibrary): string[] {
   const errs: string[] = []
   if (!isRecord(library) || !isRecord(library.providers)) {
@@ -244,31 +383,56 @@ export function validate(library: PiLibrary): string[] {
     // 键为「__proto__」的赋值会触发原型 setter（变成设原型而非写入），持久化前显式拒绝
     if (name === '__proto__') errs.push(`provider 名称不能为保留键「__proto__」`)
     // 残缺条目（如直接调 /api/save 提交的结构）：报校验错误而不是抛 TypeError 变 500
-    if (typeof lp !== 'object' || lp === null || typeof lp.config !== 'object' || lp.config === null) {
+    if (!isRecord(lp) || !isRecord(lp.config)) {
       errs.push(`provider「${name}」条目缺少 config 对象`)
       continue
     }
-    if (lp.config.models !== undefined && !Array.isArray(lp.config.models)) {
+    if (typeof lp.enabled !== 'boolean') errs.push(`provider「${name}」的 enabled 必须是布尔值`)
+    const config = lp.config
+    const label = `provider「${name}」`
+    for (const key of ['name', 'api', 'baseUrl', 'apiKey']) {
+      const value = config[key]
+      if (value !== undefined && (typeof value !== 'string' || !value.trim())) errs.push(`${label}.${key} 必须是非空字符串`)
+    }
+    if (config.authHeader !== undefined && typeof config.authHeader !== 'boolean') errs.push(`${label}.authHeader 必须是布尔值`)
+    if (config.oauth !== undefined && config.oauth !== 'radius') errs.push(`${label}.oauth 仅支持 radius`)
+    if (config.oauth !== undefined && !config.baseUrl) errs.push(`${label} 配置 oauth 时必须提供 baseUrl`)
+    validateHeaders(errs, label, config.headers)
+    validateCompat(errs, label, config.compat)
+    if (config.modelOverrides !== undefined) {
+      if (!isRecord(config.modelOverrides)) errs.push(`${label}.modelOverrides 必须是对象`)
+      else for (const [id, override] of Object.entries(config.modelOverrides)) {
+        const overrideLabel = `${label}.modelOverrides[${id}]`
+        if (!isRecord(override)) errs.push(`${overrideLabel} 必须是对象`)
+        else validateModelFields(errs, overrideLabel, override, true)
+      }
+    }
+    if (config.models !== undefined && !Array.isArray(config.models)) {
       errs.push(`provider「${name}」的 models 不是数组`)
       continue
     }
+    if (!config.models?.length && !config.baseUrl && !config.headers && !config.compat &&
+      !Object.keys(config.modelOverrides ?? {}).length && !config.apiKey && !config.oauth && config.authHeader === undefined) {
+      errs.push(`${label} 需要至少一项模型、地址、认证或覆盖配置`)
+    }
     const seen = new Set<string>()
-    for (const [index, m] of (lp.config.models ?? []).entries()) {
-      if (typeof m !== 'object' || m === null) {
+    for (const [index, m] of (config.models ?? []).entries()) {
+      if (!isRecord(m)) {
         errs.push(`provider「${name}」下有模型条目不是对象`)
         continue
       }
-      const modelLabel = m.id && String(m.id).trim()
-        ? `provider「${name}」下模型「${String(m.id)}」`
+      const modelLabel = typeof m.id === 'string' && m.id.trim()
+        ? `provider「${name}」下模型「${m.id}」`
         : `provider「${name}」下第 ${index + 1} 个模型`
-      if (!m.id || !String(m.id).trim()) {
-        errs.push(`provider「${name}」下有模型缺少 id`)
+      if (typeof m.id !== 'string' || !m.id.trim()) {
+        errs.push(`provider「${name}」下模型 id 必须是非空字符串`)
       } else if (seen.has(m.id)) {
         errs.push(`provider「${name}」下模型 id 重复：${m.id}`)
       } else {
         seen.add(m.id)
       }
-      validateCost(errs, modelLabel, m.cost)
+      // api / baseUrl 省略时可能由 pi 的内置模型或扩展提供；不凭本地库猜测外部注册结果。
+      validateModelFields(errs, modelLabel, m)
     }
   }
   return errs
@@ -281,11 +445,10 @@ export function validate(library: PiLibrary): string[] {
 function mergeSettings(
   user: PiSettings,
   baseline: PiSettings | undefined,
-  settingsFile: string,
+  disk: PiSettings,
 ): { settings: PiSettings; externalKeys: string[] } {
   // 未提供基线（旧客户端/手工调 API）：无从判断外部变更，维持整包覆盖旧行为
   if (!baseline) return { settings: user, externalKeys: [] }
-  const disk = readJson<PiSettings>(settingsFile, SETTINGS_FILE) ?? {}
   const keys = new Set([...Object.keys(baseline), ...Object.keys(user), ...Object.keys(disk)])
   // null 原型对象构建：JSON 中出现「__proto__」键时普通赋值会触发原型 setter（原型污染）
   const out: Record<string, unknown> = Object.create(null)
@@ -312,34 +475,99 @@ function jsonEq(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
-export function saveAll(library: PiLibrary, settings: PiSettings, settingsBaseline?: PiSettings): SaveResult {
+function writeConfigFiles(
+  dir: string,
+  files: { name: string; before: string | null; after: string }[],
+): SaveResult {
+  const token = `${process.pid}-${randomUUID()}`
+  const pending = files.map((file) => ({
+    ...file,
+    path: join(dir, file.name),
+    staged: `${join(dir, file.name)}.tmp-${token}`,
+    backup: `${join(dir, file.name)}.bak-${token}`,
+  }))
+  const written: string[] = []
+  const errors: string[] = []
+  try {
+    // 所有新内容与原始备份准备完成后才替换正式文件；磁盘满时不会提前改动其中一个配置。
+    for (const file of pending) {
+      writeFileSync(file.staged, file.after, { encoding: 'utf-8', mode: 0o600 })
+      if (file.before !== null) writeFileSync(file.backup, file.before, { encoding: 'utf-8', mode: 0o600 })
+    }
+    for (const file of pending) {
+      renameSync(file.staged, file.path)
+      written.push(file.name)
+    }
+  } catch (e) {
+    errors.push(`写入失败：${(e as Error).message}`)
+    // 反向恢复已经替换的文件；rename 备份不需要再次写入完整内容，适用于磁盘空间不足。
+    for (const file of [...pending].reverse()) {
+      if (!written.includes(file.name)) continue
+      try {
+        if (file.before === null) unlinkSync(file.path)
+        else renameSync(file.backup, file.path)
+        written.splice(written.indexOf(file.name), 1)
+      } catch (rollbackError) {
+        const recovery = file.before === null ? `原文件不存在：${file.path}` : `原始备份保留在 ${file.backup}`
+        errors.push(`回滚 ${file.name} 失败：${(rollbackError as Error).message}；${recovery}`)
+      }
+    }
+  }
+  const cleanupErrors: string[] = []
+  for (const file of pending) {
+    // 回滚失败的备份必须保留，供恢复权限后人工恢复；清理错误不改变已完成的保存结果。
+    const cleanup = [file.staged]
+    if (!errors.length || !written.includes(file.name)) cleanup.push(file.backup)
+    for (const path of cleanup) {
+      try {
+        if (existsSync(path)) unlinkSync(path)
+      } catch (e) {
+        cleanupErrors.push(`${path}：${(e as Error).message}`)
+      }
+    }
+  }
+  if (cleanupErrors.length) console.warn('配置临时文件清理失败：', cleanupErrors.join('；'))
+  if (errors.length) console.error('配置保存失败：', errors.join('；'))
+  return { ok: errors.length === 0, errors, written }
+}
+
+export function saveAll(
+  library: PiLibrary,
+  settings: PiSettings,
+  settingsBaseline?: PiSettings,
+  revision?: string,
+): SaveResult {
   // 后端是最后一道防线：即使旧客户端或手工 API 提交部分 cost，也只写出 Pi 可加载的完整结构。
   const normalizedLibrary = clone(library)
   normalizeLibraryCosts(normalizedLibrary)
   const errors = validate(normalizedLibrary)
   if (errors.length) return { ok: false, errors, written: [] }
   const dir = agentDir()
-  const written: string[] = []
   try {
+    const before = CONFIG_FILES.map((name) => {
+      const file = join(dir, name)
+      return existsSync(file) ? readFileSync(file, 'utf-8') : null
+    })
+    if (!revision || revision !== configRevision(before)) {
+      return { ok: false, conflict: true, errors: ['配置已被外部修改或页面版本已过期，请重新加载后再保存。'], written: [] }
+    }
     // 先算 settings 合并结果再写盘：settings.json 若被外部写坏（非法 JSON），
     // 在任何文件落盘前失败，保持「解析失败阻断一切写入」的约定
-    const merged = mergeSettings(settings, settingsBaseline, join(dir, SETTINGS_FILE))
+    const diskSettings = parseJson<PiSettings>(before[2], SETTINGS_FILE) ?? {}
+    if (!isRecord(diskSettings)) throw new Error(`${SETTINGS_FILE} 结构异常：必须是对象`)
+    const merged = mergeSettings(settings, settingsBaseline, diskSettings)
+    const after = [serialize(normalizedLibrary), serialize(projectModels(normalizedLibrary)), serialize(merged.settings)]
     mkdirSync(join(dir, LIBRARY_DIR), { recursive: true })
-    writeFileAtomic(join(dir, LIBRARY_DIR, LIBRARY_FILE), serialize(normalizedLibrary))
-    written.push(`${LIBRARY_DIR}/${LIBRARY_FILE}`)
-    writeFileAtomic(join(dir, MODELS_FILE), serialize(projectModels(normalizedLibrary)))
-    written.push(MODELS_FILE)
-    writeFileAtomic(join(dir, SETTINGS_FILE), serialize(merged.settings))
-    written.push(SETTINGS_FILE)
+    const result = writeConfigFiles(dir, CONFIG_FILES.map((name, index) => ({ name, before: before[index], after: after[index] })))
+    if (!result.ok) return result
     return {
-      ok: true,
-      errors: [],
-      written,
+      ...result,
+      revision: configRevision(after),
       settings: merged.settings,
       externalSettingsKeys: merged.externalKeys,
     }
   } catch (e) {
-    return { ok: false, errors: [`写入失败：${(e as Error).message}`], written }
+    return { ok: false, errors: [`写入失败：${(e as Error).message}`], written: [] }
   }
 }
 

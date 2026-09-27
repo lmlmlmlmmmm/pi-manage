@@ -5,6 +5,7 @@ import type { FetchedModel, PiModel, PiProvider } from '../types'
 import { PI_API_OPTIONS } from '../types'
 import UaSelect from './UaSelect.vue'
 import ImportModelsModal from './ImportModelsModal.vue'
+import { isAuthHeader, modelKeyHeaders, readModelApiKey, providerAuthNotice } from '../lib/modelAuth'
 
 const props = defineProps<{
   show: boolean
@@ -38,6 +39,9 @@ const form = reactive({
 
 // 在线导入弹窗：用表单当前填写的 baseUrl/apiKey/api/headers 拉取模型
 const imShow = ref(false)
+const authNotice = computed(() => providerAuthNotice({ ...props.initial, apiKey: form.apiKey },
+  form.models.some((model) => Object.keys(model.headers ?? {}).some(isAuthHeader))))
+const inheritsConnection = computed(() => form.models.some((model) => !(model.api || form.api) || !(model.baseUrl || form.baseUrl.trim())))
 
 // 传给 ImportModelsModal 的临时 provider（表单实时值）
 const tempProvider = computed<PiProvider>(() => {
@@ -55,10 +59,23 @@ const tempProvider = computed<PiProvider>(() => {
 })
 
 // 导入的模型（含元数据）加入表单，保存时一并写入 provider
-function onImported(models: FetchedModel[]) {
+function onImported(models: FetchedModel[], connection: PiProvider) {
+  let headers: Record<string, string> | undefined
+  try {
+    if (connection.apiKey !== form.apiKey.trim()) {
+      headers = modelKeyHeaders({ ...tempProvider.value, api: connection.api }, {}, connection.apiKey ?? '')
+    }
+  } catch (e) {
+    message.error((e as Error).message)
+    return
+  }
   for (const m of models) {
     if (form.models.some((x) => x.id === m.id)) continue
     const entry: PiModel = { id: m.id }
+    // 获取时临时换过地址或密钥，需绑定到本次导入的模型，Provider 默认配置保持独立。
+    if (headers) entry.headers = { ...headers }
+    if (connection.baseUrl !== form.baseUrl.trim()) entry.baseUrl = connection.baseUrl
+    if (connection.api !== form.api) entry.api = connection.api
     if (m.name) entry.name = m.name
     if (m.contextWindow !== undefined) entry.contextWindow = m.contextWindow
     if (m.maxTokens !== undefined) entry.maxTokens = m.maxTokens
@@ -146,8 +163,25 @@ function save() {
     if (h.key.trim()) headers[h.key.trim()] = h.value
   }
   set('headers', Object.keys(headers).length ? headers : undefined)
+  let models: PiModel[]
+  try {
+    // Provider 的协议或 Bearer 设置变化时，已配置的模型独立密钥继续使用新认证方式，避免混入默认密钥。
+    models = form.models.map((model) => {
+      const previous = props.initial?.models?.find((item) => item.id === model.id)
+      const key = previous && readModelApiKey(previous.headers, { ...props.initial, api: previous.api ?? props.initial?.api })
+      if (key === undefined) return model
+      const customHeaders = Object.fromEntries(Object.entries(model.headers ?? {}).filter(([name]) => !isAuthHeader(name)))
+      return {
+        ...model,
+        headers: modelKeyHeaders({ ...provider, api: model.api ?? provider.api }, customHeaders, key),
+      }
+    })
+  } catch (e) {
+    error.value = (e as Error).message
+    return
+  }
   // models 空则删除字段（与不定义等价，pi 用内置/默认模型）
-  set('models', form.models.length ? form.models : undefined)
+  set('models', models.length ? models : undefined)
   emit('saved', { originalName: props.providerName, name, provider })
 }
 </script>
@@ -157,7 +191,8 @@ function save() {
     :show="props.show"
     preset="card"
     :title="props.providerName ? '编辑 Provider' : '新增 Provider'"
-    :style="{ width: '660px' }"
+    :style="{ width: '660px', maxHeight: 'calc(100vh - 48px)' }"
+    :content-style="{ overflowY: 'auto', minHeight: '0' }"
     :mask-closable="false"
     @update:show="emit('update:show', $event)"
   >
@@ -172,6 +207,9 @@ function save() {
         <n-form-item class="span-2" label="baseUrl">
           <n-input v-model:value="form.baseUrl" class="mono" placeholder="https://example.com/v1" />
         </n-form-item>
+        <n-alert v-if="inheritsConnection" class="span-2" type="info" :show-icon="false">
+          部分模型未显式指定协议或地址，需由 pi 内置模型或扩展提供；自定义中转模型请在此补全，或在模型上单独设置。
+        </n-alert>
         <n-form-item class="span-2" label="apiKey（支持 $ENV_VAR 与 !command 语法）">
           <n-input
             v-model:value="form.apiKey"
@@ -180,6 +218,7 @@ function save() {
             placeholder="留空表示依赖 /login 或 auth.json 提供认证"
           />
         </n-form-item>
+        <n-alert class="span-2" :type="authNotice.type" :show-icon="false">{{ authNotice.text }}</n-alert>
         <n-form-item label="authHeader（自动携带 Authorization: Bearer）">
           <n-switch v-model:value="form.authHeader" />
         </n-form-item>
@@ -190,7 +229,7 @@ function save() {
             </div>
             <div v-for="(h, i) in form.headers" :key="i" class="kv-row">
               <n-input v-model:value="h.key" class="mono" placeholder="Header 名（如 User-Agent）" />
-              <n-input v-model:value="h.value" placeholder="值" />
+              <n-input v-model:value="h.value" :type="isAuthHeader(h.key) ? 'password' : 'text'" show-password-on="click" placeholder="值" />
               <n-button size="small" quaternary type="error" @click="form.headers.splice(i, 1)">移除</n-button>
             </div>
             <n-button size="small" dashed @click="form.headers.push({ key: '', value: '' })">+ 添加 header</n-button>
