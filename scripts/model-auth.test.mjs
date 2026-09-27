@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import childProcess from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
-import { modelKeyHeaders, mergeHeaders, readModelApiKey, redactHeaders, providerAuthNotice } from '../src/lib/modelAuth.ts'
+import { modelKeyHeaders, mergeHeaders, readModelApiKey, redactHeaders } from '../src/lib/modelAuth.ts'
 import { resolveRequestHeaders } from '../server/requestAuth.ts'
 
 const cases = [
@@ -13,19 +13,6 @@ const cases = [
   ['google-generative-ai', false, { 'x-goog-api-key': 'model-key' }],
   ['google-generative-ai', true, { 'x-goog-api-key': 'model-key', Authorization: 'Bearer model-key' }],
 ]
-
-test('认证提示不读取凭据或泄露密钥，独立模型认证不能被标记为 Provider 已可用', () => {
-  const missing = providerAuthNotice({}, true)
-  assert.equal(missing.type, 'warning')
-  assert.match(missing.text, /不能单独使模型出现在/)
-  assert.match(missing.text, /未验证/)
-  for (const apiKey of ['fixture-secret', '$FIXTURE_SECRET', '!fixture-secret-command']) {
-    const notice = providerAuthNotice({ apiKey }, true)
-    assert.ok(!notice.text.includes(apiKey))
-    assert.match(notice.text, /不代表.*可用性已验证/)
-  }
-  assert.match(providerAuthNotice({ oauth: 'radius' }).text, /OAuth 登录/)
-})
 
 for (const [api, authHeader, expected] of cases) {
   test(`${api}${authHeader ? ' + Bearer' : ''}：独立密钥可保存重读，移除后恢复 Provider 密钥`, () => {

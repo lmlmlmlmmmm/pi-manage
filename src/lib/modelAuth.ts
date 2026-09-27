@@ -4,21 +4,6 @@ export function isAuthHeader(name: string): boolean {
   return ['authorization', 'x-api-key', 'x-goog-api-key'].includes(name.trim().toLowerCase())
 }
 
-// 表单只能说明配置来源，不能据此断言 pi 登录状态；模型认证头也不能让 Provider 自动可用。
-export function providerAuthNotice(provider: PiProvider | null | undefined, hasModelAuth = false): { type: 'info' | 'warning'; text: string } {
-  const key = typeof provider?.apiKey === 'string' ? provider.apiKey.trim() : ''
-  if (!key) {
-    return {
-      type: hasModelAuth ? 'warning' : 'info',
-      text: `${provider?.oauth ? 'Provider 依赖 pi 的 OAuth 登录。' : 'Provider 未填写 API Key，需由 pi 登录或环境认证提供。'}${hasModelAuth ? '模型独立认证仅覆盖请求，不能单独使模型出现在 /model 中。' : ''}本工具未验证这些外部认证。`,
-    }
-  }
-  return {
-    type: 'info',
-    text: `${key.startsWith('!') || /\$(?:\{|[A-Za-z_])/.test(key) ? 'Provider Key 使用动态取值，需在启动 pi 的环境中可解析。' : 'Provider Key 已填写。'}pi 已保存的登录凭据优先于此 Key；接口测试通过不代表 /model 可用性已验证。`,
-  }
-}
-
 // HTTP 头名不区分大小写，模型覆盖不能留下另一种大小写的旧密钥。
 export function mergeHeaders(...sources: (Record<string, string> | undefined)[]): Record<string, string> {
   const headers: Record<string, string> = {}

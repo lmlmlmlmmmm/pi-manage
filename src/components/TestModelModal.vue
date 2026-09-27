@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
 import type { PiModel, PiProvider, TestModelResult } from '../types'
-import { isAuthHeader, providerAuthNotice } from '../lib/modelAuth'
 
 // 模型连接测试：提示词仅随本次请求发送，不写配置；结果按连接阶段在终端区展示。
 
@@ -30,7 +29,6 @@ let requestVersion = 0
 
 const effectiveApi = computed(() => props.model?.api ?? props.provider?.api ?? '未设置')
 const actionLabel = computed(() => (result.value ? '重新测试' : '开始测试'))
-const authNotice = computed(() => providerAuthNotice(props.provider, Object.keys(props.model?.headers ?? {}).some(isAuthHeader)))
 
 watch(
   () => props.show,
@@ -143,7 +141,6 @@ function updateShow(show: boolean) {
       <n-tag size="small" :bordered="false">{{ effectiveApi }}</n-tag>
     </div>
 
-    <n-alert class="tm-auth-notice" :type="authNotice.type" :show-icon="false">{{ authNotice.text }}</n-alert>
     <div class="tm-test-options">
       <n-checkbox v-model:checked="stream" :disabled="testing">流式测试（与 pi 一致）</n-checkbox>
       <span class="muted">关闭后测试普通 JSON 对话；结果在响应结束后展示。</span>
@@ -233,7 +230,6 @@ function updateShow(show: boolean) {
 </template>
 
 <style scoped>
-.tm-auth-notice,
 .tm-test-options {
   margin-bottom: 12px;
 }

@@ -1,6 +1,6 @@
 {
   "name": "pi-manage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "pi 本地配置管理：Provider、模型、独立 API Key 与默认设置，支持 pi 扩展和独立启动",
   "license": "MIT",
   "repository": {

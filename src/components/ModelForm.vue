@@ -5,7 +5,7 @@ import type { FetchedModel, ModelMeta, PiModel, PiProvider } from '../types'
 import { PI_API_OPTIONS, THINKING_LEVELS } from '../types'
 import UaSelect from './UaSelect.vue'
 import ImportModelsModal from './ImportModelsModal.vue'
-import { isAuthHeader, mergeHeaders, modelKeyHeaders, readModelApiKey, providerAuthNotice } from '../lib/modelAuth'
+import { isAuthHeader, mergeHeaders, modelKeyHeaders, readModelApiKey } from '../lib/modelAuth'
 
 const props = defineProps<{
   show: boolean
@@ -112,7 +112,6 @@ const keyModeOptions = computed(() => [
   ...(form.keyMode === 'headers' || form.headers.some((h) => isAuthHeader(h.key))
     ? [{ label: '自定义 Header', value: 'headers' }] : []),
 ])
-const authNotice = computed(() => providerAuthNotice(props.provider, form.keyMode !== 'inherit'))
 const inheritsConnection = computed(() => !(form.api || props.provider?.api) || !(form.baseUrl.trim() || props.provider?.baseUrl))
 
 function num(v: unknown): number | null {
@@ -426,7 +425,6 @@ function testFromForm() {
         <n-form-item v-else-if="form.keyMode === 'headers'" class="span-2">
           <span class="muted">当前模型使用下方的认证 Header。切换密钥来源前，请先移除这些认证 Header。</span>
         </n-form-item>
-        <n-alert class="span-2" :type="authNotice.type" :show-icon="false">{{ authNotice.text }}</n-alert>
         <n-form-item label="reasoning">
           <n-switch v-model:value="form.reasoning" />
         </n-form-item>

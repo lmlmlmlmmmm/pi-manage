@@ -5,7 +5,7 @@ import type { FetchedModel, PiModel, PiProvider } from '../types'
 import { PI_API_OPTIONS } from '../types'
 import UaSelect from './UaSelect.vue'
 import ImportModelsModal from './ImportModelsModal.vue'
-import { isAuthHeader, modelKeyHeaders, readModelApiKey, providerAuthNotice } from '../lib/modelAuth'
+import { isAuthHeader, modelKeyHeaders, readModelApiKey } from '../lib/modelAuth'
 
 const props = defineProps<{
   show: boolean
@@ -39,8 +39,6 @@ const form = reactive({
 
 // 在线导入弹窗：用表单当前填写的 baseUrl/apiKey/api/headers 拉取模型
 const imShow = ref(false)
-const authNotice = computed(() => providerAuthNotice({ ...props.initial, apiKey: form.apiKey },
-  form.models.some((model) => Object.keys(model.headers ?? {}).some(isAuthHeader))))
 const inheritsConnection = computed(() => form.models.some((model) => !(model.api || form.api) || !(model.baseUrl || form.baseUrl.trim())))
 
 // 传给 ImportModelsModal 的临时 provider（表单实时值）
@@ -218,7 +216,6 @@ function save() {
             placeholder="留空表示依赖 /login 或 auth.json 提供认证"
           />
         </n-form-item>
-        <n-alert class="span-2" :type="authNotice.type" :show-icon="false">{{ authNotice.text }}</n-alert>
         <n-form-item label="authHeader（自动携带 Authorization: Bearer）">
           <n-switch v-model:value="form.authHeader" />
         </n-form-item>
